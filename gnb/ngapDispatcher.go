@@ -58,6 +58,9 @@ func (d *ngapDispatcher) dispatch(g *Gnb, ngapRaw []byte) {
 	case *message.PDUSessionResourceModifyConfirm:
 		g.NgapLog.Debugln("Processing NGAP PDU Session Resource Modify Indication")
 		d.pduSessionResourceModifyIndicationProcessor(g, msg, ngapRaw)
+	case *message.PathSwitchRequestAcknowledge:
+		g.NgapLog.Debugln("Processing NGAP Path Switch Request Acknowledge")
+		d.pathSwitchRequestAcknowledgeProcessor(g, msg)
 	default:
 		g.NgapLog.Warnf("Unknown NGAP PDU message: %T", ngapMsg)
 	}

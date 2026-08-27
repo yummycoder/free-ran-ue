@@ -27,6 +27,8 @@ const (
 const (
 	UE_DATA_PLANE_INITIAL_PACKET = "initial packet"
 	UE_TUNNEL_UPDATE             = "tunnel update"
+	UE_HANDOVER_COMMAND          = "handover command"
+	UE_HANDOVER_ATTACH           = "handover attach"
 	UE_IMSI_PREFIX               = "imsi-"
 )
 

@@ -13,6 +13,7 @@ import (
 )
 
 type XnPdu struct {
+	Type       byte
 	ImsiLength uint16
 	Imsi       string
 	Data       []byte
@@ -20,17 +21,25 @@ type XnPdu struct {
 
 func NewXnPdu(imsi string, data []byte) *XnPdu {
 	return &XnPdu{
+		Type:       XnTypeNgap,
 		ImsiLength: 0,
 		Imsi:       imsi,
 		Data:       data,
 	}
 }
 
+func NewTypedXnPdu(xnType byte, imsi string, data []byte) *XnPdu {
+	pdu := NewXnPdu(imsi, data)
+	pdu.Type = xnType
+	return pdu
+}
+
 func (x *XnPdu) Marshal() ([]byte, error) {
 	imsiBytes := []byte(x.Imsi)
 
-	buffer := make([]byte, 2)
-	binary.BigEndian.PutUint16(buffer, uint16(len(imsiBytes)))
+	buffer := make([]byte, 3)
+	buffer[0] = x.Type
+	binary.BigEndian.PutUint16(buffer[1:], uint16(len(imsiBytes)))
 
 	buffer = append(buffer, imsiBytes...)
 	buffer = append(buffer, x.Data...)
@@ -39,12 +48,13 @@ func (x *XnPdu) Marshal() ([]byte, error) {
 }
 
 func (x *XnPdu) Unmarshal(data []byte) error {
-	if len(data) < 2 {
+	if len(data) < 3 {
 		return fmt.Errorf("data too short")
 	}
 
-	x.ImsiLength = binary.BigEndian.Uint16(data[:2])
-	data = data[2:]
+	x.Type = data[0]
+	x.ImsiLength = binary.BigEndian.Uint16(data[1:3])
+	data = data[3:]
 
 	if len(data) < int(x.ImsiLength) {
 		return fmt.Errorf("data too short")
@@ -75,6 +85,15 @@ func xnInterfaceProcessor(conn net.Conn, g *Gnb) {
 	}
 	g.XnLog.Tracef("Received XN PDU: %+v", xnPdu)
 	g.XnLog.Debugln("Receive XN PDU")
+
+	switch xnPdu.Type {
+	case XnTypeHandoverRequest:
+		xnHandoverRequestProcessor(g, conn, &xnPdu)
+		return
+	case XnTypeHandoverAck:
+		g.XnLog.Warnln("Unexpected XN Handover Ack on listener")
+		return
+	}
 
 	ngapMsg, err := message.Parse(xnPdu.Data)
 	if err != nil {

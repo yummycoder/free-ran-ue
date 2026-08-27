@@ -87,6 +87,8 @@ type Gnb struct {
 	dlTeidToUe            sync.Map // dlTeid -> *(Ran/Xn)Ue
 	addressToUe           sync.Map // UDP address -> *(Ran/Xn)Ue
 	imsiTodlTeidAndUeType sync.Map // imsi -> dlTeidAndUeType
+	pendingHandover       sync.Map // imsi -> *pendingHandoverEntry (handover target side)
+	pathSwitchAckChans    sync.Map // ranUeNgapId -> chan pathSwitchAckResult
 
 	gtpChannel chan []byte
 
