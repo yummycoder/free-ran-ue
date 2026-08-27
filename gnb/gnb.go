@@ -1111,6 +1111,12 @@ func (g *Gnb) initApiRoutes() util.Routes {
 			Pattern:     constant.API_GNB_UE_NRDC,
 			HandlerFunc: withLogging("Console GNB UE NRDC Modify", g.ApiLog, g.handleConsoleGnbUeNrdcModify),
 		},
+		{
+			Name:        "Console GNB UE Handover",
+			Method:      constant.API_GNB_UE_HANDOVER_METHOD,
+			Pattern:     constant.API_GNB_UE_HANDOVER,
+			HandlerFunc: withLogging("Console GNB UE Handover", g.ApiLog, g.handleConsoleGnbUeHandover),
+		},
 	}
 }
 

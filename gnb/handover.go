@@ -15,11 +15,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"time"
 
+	"github.com/free-ran-ue/util"
 	"github.com/free5gc/ngap/aper"
 	"github.com/free5gc/ngap/ie"
 	"github.com/free5gc/ngap/message"
+	"github.com/gin-gonic/gin"
 )
 
 const (
@@ -214,7 +217,26 @@ func xnHandoverRequestProcessor(g *Gnb, conn net.Conn, xnPdu *XnPdu) {
 	}
 
 	ranUeNgapId := g.ranUeNgapIdGenerator.AllocateRanUeId()
-	targetDlTeid := g.teidGenerator.AllocateTeid()
+
+	// Role swap (MN->SN): if this gNB already serves the UE's secondary leg,
+	// reuse that leg's DL TEID as the new primary. DL forwarding to the UE
+	// then works the instant the UPF's FAR rewrite lands - no UE re-anchor
+	// needed for the data plane. A fresh TEID is only allocated when this
+	// gNB has no existing leg for the UE (the MN->MN' case).
+	var targetDlTeid []byte
+	g.xnUeConns.Range(func(key, value any) bool {
+		if xnUe, ok := key.(*XnUe); ok && xnUe.GetIMSI() == hoCtx.Imsi {
+			targetDlTeid = xnUe.GetDlTeid()
+			return false
+		}
+		return true
+	})
+	reusedLeg := targetDlTeid != nil
+	if !reusedLeg {
+		targetDlTeid = g.teidGenerator.AllocateTeid()
+	}
+	g.XnLog.Infof("Handover target DL TEID %s (reused existing leg: %v)",
+		hex.EncodeToString(targetDlTeid), reusedLeg)
 
 	ackChan := make(chan pathSwitchAckResult, 1)
 	g.pathSwitchAckChans.Store(ranUeNgapId, ackChan)
@@ -282,4 +304,132 @@ func xnHandoverReply(g *Gnb, conn net.Conn, imsi string, ack XnHandoverAckMsg) {
 	if _, err := conn.Write(raw); err != nil {
 		g.XnLog.Errorf("Error send handover ack: %v", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Source side: trigger + Xn transfer (MN -> SN role swap)
+// ---------------------------------------------------------------------------
+
+type ConsoleGnbUeHandoverRequest struct {
+	Imsi         string `json:"imsi" binding:"required"`
+	PduSessionId int64  `json:"pduSessionId"`
+}
+
+type ConsoleGnbUeHandoverResponse struct {
+	Message       string `json:"message"`
+	UlPrimaryTeid string `json:"ulPrimaryTeid,omitempty"`
+	UlDcTeid      string `json:"ulDcTeid,omitempty"`
+}
+
+func (g *Gnb) handleConsoleGnbUeHandover(c *gin.Context) {
+	var request ConsoleGnbUeHandoverRequest
+	if err := c.ShouldBindJSON(&request); err != nil {
+		g.ApiLog.Warnf("Error bind console gnb ue handover request: %v", err)
+		c.JSON(http.StatusBadRequest, ConsoleGnbUeHandoverResponse{
+			Message: fmt.Sprintf("Error bind console gnb ue handover request: %v", err),
+		})
+		return
+	}
+	if request.PduSessionId == 0 {
+		request.PduSessionId = 10
+	}
+
+	var ranUe *RanUe
+	g.ranUeConns.Range(func(key, value any) bool {
+		if value.(*RanUe).GetMobileIdentityIMSI() == request.Imsi {
+			ranUe = value.(*RanUe)
+		}
+		return true
+	})
+	if ranUe == nil {
+		g.ApiLog.Warnf("UE %s not found", request.Imsi)
+		c.JSON(http.StatusNotFound, ConsoleGnbUeHandoverResponse{
+			Message: fmt.Sprintf("UE %s not found", request.Imsi),
+		})
+		return
+	}
+
+	ack, err := g.processMnToSnHandover(ranUe, request.PduSessionId)
+	if err != nil {
+		g.ApiLog.Errorf("Error process handover: %v", err)
+		c.JSON(http.StatusInternalServerError, ConsoleGnbUeHandoverResponse{
+			Message: fmt.Sprintf("Error process handover: %v", err),
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, ConsoleGnbUeHandoverResponse{
+		Message:       fmt.Sprintf("UE %s handover to secondary success", request.Imsi),
+		UlPrimaryTeid: ack.UlPrimaryTeid,
+		UlDcTeid:      ack.UlDcTeid,
+	})
+}
+
+// processMnToSnHandover transfers the UE context to the Xn peer (the current
+// secondary), which performs the path switch and becomes the new master.
+// This gNB keeps serving its leg, now as the secondary.
+func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64) (*XnHandoverAckMsg, error) {
+	g.XnLog.Infof("Processing MN->SN handover for UE %s", ranUe.GetMobileIdentityIMSI())
+
+	hoCtx := XnHandoverContext{
+		Imsi:              ranUe.GetMobileIdentityIMSI(),
+		AmfUeNgapId:       ranUe.GetAmfUeId(),
+		SourceRanUeNgapId: ranUe.GetRanUeId(),
+		UlTeid:            hex.EncodeToString(ranUe.GetUlTeid()),
+		SecondaryDlTeid:   hex.EncodeToString(ranUe.GetDlTeid()),
+		SecondaryN3Ip:     g.ranN3Ip,
+		PduSessionId:      pduSessionId,
+	}
+	payload, err := json.Marshal(hoCtx)
+	if err != nil {
+		return nil, fmt.Errorf("marshal handover context: %v", err)
+	}
+
+	xnConn, err := util.TcpDialWithOptionalLocalAddress(g.xnInterface.xnDialIp, g.xnInterface.xnDialPort, "")
+	if err != nil {
+		return nil, fmt.Errorf("dial xn: %v", err)
+	}
+	defer func() {
+		if err := xnConn.Close(); err != nil {
+			g.XnLog.Warnf("Error close xn connection: %v", err)
+		}
+	}()
+
+	pdu := NewTypedXnPdu(XnTypeHandoverRequest, hoCtx.Imsi, payload)
+	raw, err := pdu.Marshal()
+	if err != nil {
+		return nil, fmt.Errorf("marshal xn pdu: %v", err)
+	}
+	if _, err := xnConn.Write(raw); err != nil {
+		return nil, fmt.Errorf("send handover request to xn: %v", err)
+	}
+	g.XnLog.Debugln("Sent XN Handover Request")
+
+	if err := xnConn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return nil, fmt.Errorf("set read deadline: %v", err)
+	}
+	buffer := make([]byte, 4096)
+	n, err := xnConn.Read(buffer)
+	if err != nil {
+		return nil, fmt.Errorf("read handover ack from xn: %v", err)
+	}
+
+	ackPdu := &XnPdu{}
+	if err := ackPdu.Unmarshal(buffer[:n]); err != nil {
+		return nil, fmt.Errorf("unmarshal handover ack xn pdu: %v", err)
+	}
+	if ackPdu.Type != XnTypeHandoverAck {
+		return nil, fmt.Errorf("unexpected xn pdu type %d in handover ack", ackPdu.Type)
+	}
+	var ack XnHandoverAckMsg
+	if err := json.Unmarshal(ackPdu.Data, &ack); err != nil {
+		return nil, fmt.Errorf("unmarshal handover ack: %v", err)
+	}
+	if !ack.Accepted {
+		return nil, fmt.Errorf("handover rejected by target: %s", ack.Reason)
+	}
+
+	g.XnLog.Infof("Handover complete: this gNB is now the secondary for UE %s "+
+		"(UL primary TEID %s, UL DC TEID %s)", hoCtx.Imsi, ack.UlPrimaryTeid, ack.UlDcTeid)
+	return &ack, nil
 }
