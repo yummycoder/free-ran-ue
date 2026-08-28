@@ -29,6 +29,7 @@ const (
 	UE_TUNNEL_UPDATE             = "tunnel update"
 	UE_HANDOVER_COMMAND          = "handover command"
 	UE_HANDOVER_ATTACH           = "handover attach"
+	UE_HANDOVER_READY            = "handover ready"
 	UE_IMSI_PREFIX               = "imsi-"
 )
 

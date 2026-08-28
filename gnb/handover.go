@@ -669,5 +669,22 @@ func (g *Gnb) processHandoverAttach(ranUe *RanUe, imsi string) error {
 	g.RanLog.Infof("Adopted UE %s (RAN UE NGAP ID %d, DL TEID %s)",
 		imsi, ranUe.GetRanUeId(), hex.EncodeToString(ranUe.GetDlTeid()))
 
+	// Barrier: wait until the UE's data-plane initial packet has been
+	// processed (dataPlaneAddress wired) before telling the UE it may swap
+	// its connections. Until the swap, uplink keeps flowing through the old
+	// master; downlink only flips at the PathSwitchRequest below, which we
+	// send after the barrier - so neither direction hits an unwired map.
+	deadline := time.Now().Add(3 * time.Second)
+	for ranUe.GetDataPlaneAddress() == nil {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for UE %s data plane initial packet", imsi)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := ranUe.GetN1Conn().Write([]byte(constant.UE_HANDOVER_READY)); err != nil {
+		return fmt.Errorf("send handover ready to UE: %v", err)
+	}
+	g.RanLog.Infof("UE %s data plane wired; sent handover ready", imsi)
+
 	return g.completePendingHandover(imsi, ranUe)
 }

@@ -1015,6 +1015,31 @@ func (u *Ue) performHandover(payload []byte) {
 		return
 	}
 
+	// Barrier: the target confirms its data-plane wiring is complete before
+	// we abandon the old master. Until this arrives, uplink still flows
+	// through the old connections, so nothing is lost while the target
+	// finishes setup.
+	if err := newCp.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		u.RanLog.Errorf("Error set read deadline on new control plane: %+v", err)
+		return
+	}
+	readyBuffer := make([]byte, 64)
+	n, err := newCp.Read(readyBuffer)
+	if err != nil || string(readyBuffer[:n]) != constant.UE_HANDOVER_READY {
+		u.RanLog.Errorf("Handover aborted: no ready confirmation from target (n=%d, err=%v)", n, err)
+		if closeErr := newCp.Close(); closeErr != nil {
+			u.RanLog.Warnf("Error close new control plane: %+v", closeErr)
+		}
+		if closeErr := newDp.Close(); closeErr != nil {
+			u.RanLog.Warnf("Error close new data plane: %+v", closeErr)
+		}
+		return
+	}
+	if err := newCp.SetReadDeadline(time.Time{}); err != nil {
+		u.RanLog.Warnf("Error clear read deadline: %+v", err)
+	}
+	u.RanLog.Infoln("Target confirmed data plane ready; swapping connections")
+
 	u.rwLock.Lock()
 	oldCp := u.ranControlPlaneConn
 	oldDp := u.ranDataPlaneConn
