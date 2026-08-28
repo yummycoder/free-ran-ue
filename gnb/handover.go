@@ -16,8 +16,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
+	"github.com/free-ran-ue/free-ran-ue/v2/constant"
 	"github.com/free-ran-ue/util"
 	"github.com/free5gc/ngap/aper"
 	"github.com/free5gc/ngap/ie"
@@ -26,9 +28,10 @@ import (
 )
 
 const (
-	XnTypeNgap            byte = 0
-	XnTypeHandoverRequest byte = 1
-	XnTypeHandoverAck     byte = 2
+	XnTypeNgap             byte = 0
+	XnTypeHandoverRequest  byte = 1
+	XnTypeHandoverAck      byte = 2
+	XnTypeHandoverComplete byte = 3
 )
 
 // XnHandoverContext is the UE context the source gNB transfers to the
@@ -53,12 +56,27 @@ type XnHandoverAckMsg struct {
 	TargetDpPort  int    `json:"targetDpPort"`
 	UlPrimaryTeid string `json:"ulPrimaryTeid"` // from PathSwitchRequestAcknowledge
 	UlDcTeid      string `json:"ulDcTeid"`
+	// Deferred marks the two-phase (MN->MN') flow: the target has prepared
+	// the handover but will only send the PathSwitchRequest after the UE
+	// re-anchors. The source must push UE_HANDOVER_COMMAND and then wait
+	// for an XnTypeHandoverComplete frame on the same Xn connection.
+	Deferred bool `json:"deferred,omitempty"`
+}
+
+// ueHandoverTarget is the payload of UE_HANDOVER_COMMAND pushed to the UE
+// over N1: where to re-anchor its control and data planes.
+type ueHandoverTarget struct {
+	CpIp   string `json:"cpIp"`
+	CpPort int    `json:"cpPort"`
+	DpIp   string `json:"dpIp"`
+	DpPort int    `json:"dpPort"`
 }
 
 // pendingHandoverEntry is stored on the target between the Xn handover
 // request and the UE's control-plane re-attach.
 type pendingHandoverEntry struct {
 	ctx          XnHandoverContext
+	xnConn       net.Conn // held open for the XnTypeHandoverComplete reply (deferred flow)
 	targetDlTeid []byte
 	ranUeNgapId  int64
 }
@@ -73,6 +91,7 @@ type pathSwitchAckResult struct {
 // gNB as the new master: primary DL tunnel = (g.ranN3Ip, newDlTeid), and
 // the NR-DC extension carrying the secondary DL tunnel unchanged.
 func (g *Gnb) buildPathSwitchRequestWithDC(
+	includeDcExt bool,
 	ranUeNgapId, amfUeNgapId, pduSessionId int64,
 	newDlTeid []byte, secondaryDlTeid []byte, secondaryN3Ip string,
 ) ([]byte, error) {
@@ -90,7 +109,14 @@ func (g *Gnb) buildPathSwitchRequestWithDC(
 				{QosFlowIdentifier: &ie.QosFlowIdentifier{Value: 1}},
 			},
 		},
-		IEExtensions: &ie.ProtocolExtensionContainerPathSwitchRequestTransferExtIEs{
+	}
+	// The DC extension is deliberately optional. When absent, the SMF
+	// (merge/nrdc HandlePathSwitchRequestTransfer) leaves DCTunnel and the
+	// secondary-leg FARs byte-identical - which is exactly the semantics of
+	// an MN->MN' handover with the SN unchanged, and it sidesteps the
+	// unconditional SendEndMarker on the secondary leg.
+	if includeDcExt {
+		transfer.IEExtensions = &ie.ProtocolExtensionContainerPathSwitchRequestTransferExtIEs{
 			List: []ie.PathSwitchRequestTransferExtIEs{
 				{
 					Id:          &ie.ProtocolExtensionID{Value: 155},
@@ -102,7 +128,7 @@ func (g *Gnb) buildPathSwitchRequestWithDC(
 					},
 				},
 			},
-		},
+		}
 	}
 	transferBytes, err := ie.MarshalBinary(&transfer)
 	if err != nil {
@@ -238,11 +264,37 @@ func xnHandoverRequestProcessor(g *Gnb, conn net.Conn, xnPdu *XnPdu) {
 	g.XnLog.Infof("Handover target DL TEID %s (reused existing leg: %v)",
 		hex.EncodeToString(targetDlTeid), reusedLeg)
 
+	if !reusedLeg {
+		// MN->MN' (no existing leg here): two-phase. The UE's data-plane
+		// socket is connected to the old master, so DL delivered here would
+		// be undeliverable until the UE re-anchors. Prepare, ack with our
+		// endpoints, and only send the PathSwitchRequest once the UE has
+		// attached (completePendingHandover). Make-before-break.
+		g.ranUeNgapIdGenerator.ReleaseRanUeId(ranUeNgapId) // attach conn brings its own
+		g.pendingHandover.Store(hoCtx.Imsi, &pendingHandoverEntry{
+			ctx:          hoCtx,
+			xnConn:       conn,
+			targetDlTeid: targetDlTeid,
+			ranUeNgapId:  -1,
+		})
+		xnHandoverReply(g, conn, hoCtx.Imsi, XnHandoverAckMsg{
+			Accepted:     true,
+			Deferred:     true,
+			TargetCpIp:   g.ranControlPlaneIp,
+			TargetCpPort: g.ranControlPlanePort,
+			TargetDpIp:   g.ranDataPlaneIp,
+			TargetDpPort: g.ranDataPlanePort,
+		})
+		g.XnLog.Infoln("XN Handover Request prepared (deferred: awaiting UE re-anchor)")
+		return
+	}
+
 	ackChan := make(chan pathSwitchAckResult, 1)
 	g.pathSwitchAckChans.Store(ranUeNgapId, ackChan)
 	defer g.pathSwitchAckChans.Delete(ranUeNgapId)
 
 	psRaw, err := g.buildPathSwitchRequestWithDC(
+		true,
 		ranUeNgapId, hoCtx.AmfUeNgapId, hoCtx.PduSessionId,
 		targetDlTeid, secondaryDlTeid, hoCtx.SecondaryN3Ip)
 	if err != nil {
@@ -313,6 +365,7 @@ func xnHandoverReply(g *Gnb, conn net.Conn, imsi string, ack XnHandoverAckMsg) {
 type ConsoleGnbUeHandoverRequest struct {
 	Imsi         string `json:"imsi" binding:"required"`
 	PduSessionId int64  `json:"pduSessionId"`
+	TargetXn     string `json:"targetXn,omitempty"`
 }
 
 type ConsoleGnbUeHandoverResponse struct {
@@ -331,7 +384,25 @@ func (g *Gnb) handleConsoleGnbUeHandover(c *gin.Context) {
 		return
 	}
 	if request.PduSessionId == 0 {
-		request.PduSessionId = 10
+		request.PduSessionId = int64(constant.PDU_SESSION_ID)
+	}
+	targetXnIp, targetXnPort := "", 0
+	if request.TargetXn != "" {
+		host, portStr, err := net.SplitHostPort(request.TargetXn)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, ConsoleGnbUeHandoverResponse{
+				Message: fmt.Sprintf("Invalid targetXn %q: %v", request.TargetXn, err),
+			})
+			return
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, ConsoleGnbUeHandoverResponse{
+				Message: fmt.Sprintf("Invalid targetXn port %q: %v", portStr, err),
+			})
+			return
+		}
+		targetXnIp, targetXnPort = host, port
 	}
 
 	var ranUe *RanUe
@@ -349,7 +420,7 @@ func (g *Gnb) handleConsoleGnbUeHandover(c *gin.Context) {
 		return
 	}
 
-	ack, err := g.processMnToSnHandover(ranUe, request.PduSessionId)
+	ack, err := g.processMnToSnHandover(ranUe, request.PduSessionId, targetXnIp, targetXnPort)
 	if err != nil {
 		g.ApiLog.Errorf("Error process handover: %v", err)
 		c.JSON(http.StatusInternalServerError, ConsoleGnbUeHandoverResponse{
@@ -359,7 +430,7 @@ func (g *Gnb) handleConsoleGnbUeHandover(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, ConsoleGnbUeHandoverResponse{
-		Message:       fmt.Sprintf("UE %s handover to secondary success", request.Imsi),
+		Message:       fmt.Sprintf("UE %s handover success", request.Imsi),
 		UlPrimaryTeid: ack.UlPrimaryTeid,
 		UlDcTeid:      ack.UlDcTeid,
 	})
@@ -368,8 +439,13 @@ func (g *Gnb) handleConsoleGnbUeHandover(c *gin.Context) {
 // processMnToSnHandover transfers the UE context to the Xn peer (the current
 // secondary), which performs the path switch and becomes the new master.
 // This gNB keeps serving its leg, now as the secondary.
-func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64) (*XnHandoverAckMsg, error) {
-	g.XnLog.Infof("Processing MN->SN handover for UE %s", ranUe.GetMobileIdentityIMSI())
+func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64, targetXnIp string, targetXnPort int) (*XnHandoverAckMsg, error) {
+	if targetXnIp == "" {
+		targetXnIp = g.xnInterface.xnDialIp
+		targetXnPort = g.xnInterface.xnDialPort
+	}
+	g.XnLog.Infof("Processing handover for UE %s to Xn target %s:%d",
+		ranUe.GetMobileIdentityIMSI(), targetXnIp, targetXnPort)
 
 	hoCtx := XnHandoverContext{
 		Imsi:              ranUe.GetMobileIdentityIMSI(),
@@ -385,7 +461,7 @@ func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64) (*XnHandov
 		return nil, fmt.Errorf("marshal handover context: %v", err)
 	}
 
-	xnConn, err := util.TcpDialWithOptionalLocalAddress(g.xnInterface.xnDialIp, g.xnInterface.xnDialPort, "")
+	xnConn, err := util.TcpDialWithOptionalLocalAddress(targetXnIp, targetXnPort, "")
 	if err != nil {
 		return nil, fmt.Errorf("dial xn: %v", err)
 	}
@@ -429,7 +505,169 @@ func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64) (*XnHandov
 		return nil, fmt.Errorf("handover rejected by target: %s", ack.Reason)
 	}
 
-	g.XnLog.Infof("Handover complete: this gNB is now the secondary for UE %s "+
-		"(UL primary TEID %s, UL DC TEID %s)", hoCtx.Imsi, ack.UlPrimaryTeid, ack.UlDcTeid)
-	return &ack, nil
+	if !ack.Deferred {
+		g.XnLog.Infof("Handover complete: this gNB is now the secondary for UE %s "+
+			"(UL primary TEID %s, UL DC TEID %s)", hoCtx.Imsi, ack.UlPrimaryTeid, ack.UlDcTeid)
+		return &ack, nil
+	}
+
+	// Deferred (MN->MN') flow: push the re-anchor command to the UE over N1,
+	// then wait on the same Xn connection for the target's completion notice
+	// (the target sends its PathSwitchRequest only after the UE attaches).
+	targetJson, err := json.Marshal(ueHandoverTarget{
+		CpIp:   ack.TargetCpIp,
+		CpPort: ack.TargetCpPort,
+		DpIp:   ack.TargetDpIp,
+		DpPort: ack.TargetDpPort,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal ue handover target: %v", err)
+	}
+	if _, err := ranUe.GetN1Conn().Write(append([]byte(constant.UE_HANDOVER_COMMAND+" "), targetJson...)); err != nil {
+		return nil, fmt.Errorf("send handover command to UE: %v", err)
+	}
+	g.RanLog.Infof("Sent handover command to UE %s (target %s:%d)", hoCtx.Imsi, ack.TargetCpIp, ack.TargetCpPort)
+
+	if err := xnConn.SetReadDeadline(time.Now().Add(20 * time.Second)); err != nil {
+		return nil, fmt.Errorf("set read deadline: %v", err)
+	}
+	n, err = xnConn.Read(buffer)
+	if err != nil {
+		return nil, fmt.Errorf("read handover complete from xn: %v", err)
+	}
+	completePdu := &XnPdu{}
+	if err := completePdu.Unmarshal(buffer[:n]); err != nil {
+		return nil, fmt.Errorf("unmarshal handover complete xn pdu: %v", err)
+	}
+	if completePdu.Type != XnTypeHandoverComplete {
+		return nil, fmt.Errorf("unexpected xn pdu type %d in handover complete", completePdu.Type)
+	}
+	var complete XnHandoverAckMsg
+	if err := json.Unmarshal(completePdu.Data, &complete); err != nil {
+		return nil, fmt.Errorf("unmarshal handover complete: %v", err)
+	}
+	if !complete.Accepted {
+		return nil, fmt.Errorf("handover failed at target: %s", complete.Reason)
+	}
+
+	g.XnLog.Infof("Handover complete: UE %s moved to new master (UL primary TEID %s); "+
+		"this gNB no longer serves it", hoCtx.Imsi, complete.UlPrimaryTeid)
+	return &complete, nil
+}
+
+// pathSwitchRequestFailureProcessor delivers the AMF's rejection to the
+// waiting handover flow immediately instead of burning the ack timeout.
+func (d *ngapDispatcher) pathSwitchRequestFailureProcessor(g *Gnb, msg *message.PathSwitchRequestFailure) {
+	if msg.RANUENGAPID == nil {
+		g.NgapLog.Warnln("PathSwitchRequestFailure without RAN UE NGAP ID")
+		return
+	}
+	g.deliverPathSwitchAck(msg.RANUENGAPID, pathSwitchAckResult{
+		err: fmt.Errorf("PathSwitchRequestFailure from AMF"),
+	})
+}
+
+// completePendingHandover runs on the target after the UE has re-anchored
+// its control plane here (MN->MN' deferred flow): send the PathSwitchRequest
+// (no DC extension - the SN leg must stay byte-identical at the SMF), await
+// the Ack, then notify the source over the held Xn connection.
+func (g *Gnb) completePendingHandover(imsi string, ranUe *RanUe) error {
+	entryValue, exists := g.pendingHandover.Load(imsi)
+	if !exists {
+		return fmt.Errorf("no pending handover for %s", imsi)
+	}
+	g.pendingHandover.Delete(imsi)
+	entry := entryValue.(*pendingHandoverEntry)
+
+	ackChan := make(chan pathSwitchAckResult, 1)
+	g.pathSwitchAckChans.Store(ranUe.GetRanUeId(), ackChan)
+	defer g.pathSwitchAckChans.Delete(ranUe.GetRanUeId())
+
+	psRaw, err := g.buildPathSwitchRequestWithDC(
+		false,
+		ranUe.GetRanUeId(), entry.ctx.AmfUeNgapId, entry.ctx.PduSessionId,
+		ranUe.GetDlTeid(), nil, "")
+	if err != nil {
+		g.notifyHandoverComplete(entry, imsi, XnHandoverAckMsg{Accepted: false, Reason: err.Error()})
+		return fmt.Errorf("build PathSwitchRequest: %v", err)
+	}
+	if _, err := g.n2Conn.Write(psRaw); err != nil {
+		g.notifyHandoverComplete(entry, imsi, XnHandoverAckMsg{Accepted: false, Reason: err.Error()})
+		return fmt.Errorf("send PathSwitchRequest: %v", err)
+	}
+	g.NgapLog.Infoln("Sent PathSwitchRequest (MN->MN', no DC ext) to AMF")
+
+	var ack pathSwitchAckResult
+	select {
+	case ack = <-ackChan:
+	case <-time.After(5 * time.Second):
+		ack.err = fmt.Errorf("timeout waiting for PathSwitchRequestAcknowledge")
+	}
+	if ack.err != nil {
+		g.notifyHandoverComplete(entry, imsi, XnHandoverAckMsg{Accepted: false, Reason: ack.err.Error()})
+		return fmt.Errorf("path switch failed: %v", ack.err)
+	}
+
+	if len(ack.ulPrimaryTeid) > 0 {
+		ranUe.SetUlTeid(ack.ulPrimaryTeid)
+	}
+	g.notifyHandoverComplete(entry, imsi, XnHandoverAckMsg{
+		Accepted:      true,
+		UlPrimaryTeid: hex.EncodeToString(ack.ulPrimaryTeid),
+		UlDcTeid:      hex.EncodeToString(ack.ulDcTeid),
+	})
+	g.XnLog.Infof("Handover complete: this gNB is now the master for UE %s (path switched)", imsi)
+	return nil
+}
+
+func (g *Gnb) notifyHandoverComplete(entry *pendingHandoverEntry, imsi string, msg XnHandoverAckMsg) {
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		g.XnLog.Errorf("Error marshal handover complete: %v", err)
+		return
+	}
+	pdu := NewTypedXnPdu(XnTypeHandoverComplete, imsi, payload)
+	raw, err := pdu.Marshal()
+	if err != nil {
+		g.XnLog.Errorf("Error marshal handover complete xn pdu: %v", err)
+		return
+	}
+	if _, err := entry.xnConn.Write(raw); err != nil {
+		g.XnLog.Errorf("Error send handover complete to source: %v", err)
+	}
+	if err := entry.xnConn.Close(); err != nil {
+		g.XnLog.Debugf("Close xn connection after handover complete: %v", err)
+	}
+}
+
+// processHandoverAttach adopts a UE whose control plane just re-anchored to
+// this gNB via UE_HANDOVER_ATTACH (deferred MN->MN' flow). The accept loop
+// has already allocated this connection's RanUe and stored it in ranUeConns,
+// so NGAP downlink for the new RAN UE NGAP ID routes here automatically.
+func (g *Gnb) processHandoverAttach(ranUe *RanUe, imsi string) error {
+	g.RanLog.Infof("Processing handover attach for UE %s", imsi)
+
+	entryValue, exists := g.pendingHandover.Load(imsi)
+	if !exists {
+		return fmt.Errorf("no pending handover for %s", imsi)
+	}
+	entry := entryValue.(*pendingHandoverEntry)
+
+	ranUe.imsiOverride = imsi
+	ranUe.SetAmfUeId(entry.ctx.AmfUeNgapId)
+	if ulTeid, err := hex.DecodeString(entry.ctx.UlTeid); err == nil && len(ulTeid) > 0 {
+		ranUe.SetUlTeid(ulTeid)
+	}
+	ranUe.SetDlTeid(entry.targetDlTeid)
+	ranUe.ActivateNrdc()
+
+	g.dlTeidToUe.Store(hex.EncodeToString(ranUe.GetDlTeid()), ranUe)
+	g.imsiTodlTeidAndUeType.Store(imsi, dlTeidAndUeType{
+		dlTeid: ranUe.GetDlTeid(),
+		ueType: constant.UE_TYPE_RAN,
+	})
+	g.RanLog.Infof("Adopted UE %s (RAN UE NGAP ID %d, DL TEID %s)",
+		imsi, ranUe.GetRanUeId(), hex.EncodeToString(ranUe.GetDlTeid()))
+
+	return g.completePendingHandover(imsi, ranUe)
 }

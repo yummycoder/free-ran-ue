@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -609,6 +610,30 @@ func (g *Gnb) handleRanConnection(ctx context.Context, ranUe *RanUe) {
 		g.ranUeConns.Delete(ranUe.GetRanUeId())
 	}()
 
+	// Peek the first N1 frame: a handover re-attach announces itself with
+	// UE_HANDOVER_ATTACH instead of a NAS registration request.
+	first := make([]byte, 1024)
+	n, err := ranUe.GetN1Conn().Read(first)
+	if err != nil {
+		g.RanLog.Errorf("Error reading first N1 message: %v", err)
+		return
+	}
+	prefix := constant.UE_HANDOVER_ATTACH
+	if n > len(prefix)+1 && string(first[:len(prefix)]) == prefix {
+		imsi := strings.TrimSpace(string(first[len(prefix)+1 : n]))
+		if err := g.processHandoverAttach(ranUe, imsi); err != nil {
+			g.RanLog.Errorf("Error processing handover attach: %v", err)
+			return
+		}
+		if err := g.releaseN1(ranUe); err != nil {
+			g.RanLog.Errorf("Error releasing N1: %v", err)
+			return
+		}
+		g.RanLog.Infof("UE %s N1 released", ranUe.GetMobileIdentityIMSI())
+		return
+	}
+	ranUe.firstN1Message = first[:n]
+
 	if err := g.setupN1(ranUe); err != nil {
 		g.RanLog.Errorf("Error setting up N1: %v", err)
 		return
@@ -702,13 +727,24 @@ func (g *Gnb) processUeInitialization(ranUe *RanUe) error {
 	g.RanLog.Infoln("Processing UE initialization")
 
 	// receive ue registration request from UE and send to AMF
-	ueRegistrationRequest := make([]byte, 1024)
-	n, err := ranUe.GetN1Conn().Read(ueRegistrationRequest)
-	if err != nil {
-		return fmt.Errorf("error receive ue registration request from UE: %v", err)
+	// (handleRanConnection already read the first frame for the handover
+	// attach peek - consume it here instead of reading again)
+	var ueRegistrationRequest []byte
+	var n int
+	var err error
+	if ranUe.firstN1Message != nil {
+		ueRegistrationRequest = ranUe.firstN1Message
+		ranUe.firstN1Message = nil
+		n = len(ueRegistrationRequest)
+	} else {
+		ueRegistrationRequest = make([]byte, 1024)
+		n, err = ranUe.GetN1Conn().Read(ueRegistrationRequest)
+		if err != nil {
+			return fmt.Errorf("error receive ue registration request from UE: %v", err)
+		}
+		ueRegistrationRequest = ueRegistrationRequest[:n]
 	}
 	g.NasLog.Tracef("Received %d bytes of UE registration request from UE", n)
-	ueRegistrationRequest = ueRegistrationRequest[:n]
 
 	gmmMessage, err := nasMessage.ParseGMM(ueRegistrationRequest)
 	if err != nil {

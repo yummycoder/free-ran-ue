@@ -3,11 +3,13 @@ package ue
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -700,9 +702,15 @@ func (u *Ue) waitForRanMessage(ctx context.Context, wg *sync.WaitGroup) {
 			}
 			goto STOP_WAITING
 		default:
-			n, err := u.ranControlPlaneConn.Read(buffer)
+			conn := u.ranControlPlaneConn
+			n, err := conn.Read(buffer)
 			if err != nil {
 				if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+					if conn != u.ranControlPlaneConn {
+						// handover re-anchored the control plane; keep
+						// serving the new connection
+						continue
+					}
 					goto STOP_WAITING
 				}
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -711,9 +719,13 @@ func (u *Ue) waitForRanMessage(ctx context.Context, wg *sync.WaitGroup) {
 				u.RanLog.Warnf("Error read from ran control plane: %+v", err)
 			}
 
-			switch string(buffer[:n]) {
-			case constant.UE_TUNNEL_UPDATE:
+			msg := string(buffer[:n])
+			switch {
+			case msg == constant.UE_TUNNEL_UPDATE:
 				go u.updateDataPlane()
+			case strings.HasPrefix(msg, constant.UE_HANDOVER_COMMAND):
+				payload := strings.TrimSpace(msg[len(constant.UE_HANDOVER_COMMAND):])
+				go u.performHandover([]byte(payload))
 			default:
 				u.RanLog.Warnf("Received unknown message from RAN: %+v", buffer[:n])
 			}
@@ -839,9 +851,13 @@ func (u *Ue) handleDataPlane(ctx context.Context, wg *sync.WaitGroup) {
 			goto HANDLE_DATA_PLANE_FINISH
 		case buffer := <-u.readFromTun:
 			if !u.isNrdcEnabled() {
-				n, err := u.ranDataPlaneConn.Write(buffer)
+				conn := u.ranDataPlaneConn
+				n, err := conn.Write(buffer)
 				if err != nil {
 					if errors.Is(err, net.ErrClosed) {
+						if conn != u.ranDataPlaneConn {
+							continue // handover swapped the data plane
+						}
 						goto HANDLE_DATA_PLANE_FINISH
 					}
 					u.RanLog.Warnf("Error sent to ran data plane: %+v", err)
@@ -849,18 +865,26 @@ func (u *Ue) handleDataPlane(ctx context.Context, wg *sync.WaitGroup) {
 				u.RanLog.Tracef("Sent %d bytes of data to RAN: %+v", n, buffer[:n])
 			} else {
 				if util.IsIpInSpecifiedFlow(buffer, u.nrdc.specifiedFlow) {
-					n, err := u.dcRanDataPlaneConn.Write(buffer)
+					conn := u.dcRanDataPlaneConn
+					n, err := conn.Write(buffer)
 					if err != nil {
 						if errors.Is(err, net.ErrClosed) {
+							if conn != u.dcRanDataPlaneConn {
+								continue
+							}
 							goto HANDLE_DATA_PLANE_FINISH
 						}
 						u.RanLog.Warnf("Error sent to dc ran data plane: %+v", err)
 					}
 					u.RanLog.Tracef("Sent %d bytes of data to DC RAN: %+v", n, buffer[:n])
 				} else {
-					n, err := u.ranDataPlaneConn.Write(buffer)
+					conn := u.ranDataPlaneConn
+					n, err := conn.Write(buffer)
 					if err != nil {
 						if errors.Is(err, net.ErrClosed) {
+							if conn != u.ranDataPlaneConn {
+								continue
+							}
 							goto HANDLE_DATA_PLANE_FINISH
 						}
 						u.RanLog.Warnf("Error sent to ran data plane: %+v", err)
@@ -931,6 +955,80 @@ func (u *Ue) updateDataPlane() {
 		u.nrdc.enable = false
 		u.TunLog.Infoln("Data plane is updated to non-NRDC mode")
 	}
+}
+
+// performHandover re-anchors the UE to a new master gNB (MN->MN' flow).
+// Order is make-before-break: dial the new data plane and announce the IMSI,
+// dial the new control plane and attach (which triggers the target's
+// PathSwitchRequest), swap the connections, then close the old ones.
+func (u *Ue) performHandover(payload []byte) {
+	var target struct {
+		CpIp   string `json:"cpIp"`
+		CpPort int    `json:"cpPort"`
+		DpIp   string `json:"dpIp"`
+		DpPort int    `json:"dpPort"`
+	}
+	if err := json.Unmarshal(payload, &target); err != nil {
+		u.RanLog.Errorf("Error unmarshal handover command: %+v", err)
+		return
+	}
+	u.RanLog.Infof("Handover command: re-anchoring to CP %s:%d, DP %s:%d",
+		target.CpIp, target.CpPort, target.DpIp, target.DpPort)
+
+	newDp, err := util.UdpDialWithOptionalLocalAddress(target.DpIp, target.DpPort, u.localDataPlaneIp)
+	if err != nil {
+		u.RanLog.Errorf("Error dial new ran data plane: %+v", err)
+		return
+	}
+	if _, err := newDp.Write([]byte(constant.UE_DATA_PLANE_INITIAL_PACKET + " " + constant.UE_IMSI_PREFIX + u.supi)); err != nil {
+		u.RanLog.Errorf("Error send initial packet to new ran data plane: %+v", err)
+		return
+	}
+	go func() {
+		buffer := make([]byte, 4096)
+		for {
+			n, err := newDp.Read(buffer)
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+					u.TunLog.Debugln("New RAN data plane connection closed")
+					return
+				}
+				u.RanLog.Errorf("Error read from new ran data plane: %+v", err)
+				return
+			}
+			tmp := make([]byte, n)
+			copy(tmp, buffer[:n])
+			u.readFromRan <- tmp
+		}
+	}()
+
+	newCp, err := util.TcpDialWithOptionalLocalAddress(target.CpIp, target.CpPort, "")
+	if err != nil {
+		u.RanLog.Errorf("Error dial new ran control plane: %+v", err)
+		if closeErr := newDp.Close(); closeErr != nil {
+			u.RanLog.Warnf("Error close new data plane: %+v", closeErr)
+		}
+		return
+	}
+	if _, err := newCp.Write([]byte(constant.UE_HANDOVER_ATTACH + " " + constant.UE_IMSI_PREFIX + u.supi)); err != nil {
+		u.RanLog.Errorf("Error send handover attach: %+v", err)
+		return
+	}
+
+	u.rwLock.Lock()
+	oldCp := u.ranControlPlaneConn
+	oldDp := u.ranDataPlaneConn
+	u.ranControlPlaneConn = newCp
+	u.ranDataPlaneConn = newDp
+	u.rwLock.Unlock()
+
+	if err := oldDp.Close(); err != nil {
+		u.RanLog.Warnf("Error close old data plane: %+v", err)
+	}
+	if err := oldCp.Close(); err != nil {
+		u.RanLog.Warnf("Error close old control plane: %+v", err)
+	}
+	u.RanLog.Infoln("Handover re-anchor complete: control and data planes moved to new master")
 }
 
 func (u *Ue) GetRanDataPlaneConn() net.Conn {

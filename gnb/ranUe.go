@@ -61,6 +61,13 @@ type RanUe struct {
 
 	nrdcIndicator    bool
 	nrdcIndicatorMtx sync.Mutex
+
+	// Handover attach support: imsiOverride carries the identity for a UE
+	// adopted via Xn handover (no registration ran on this gNB, so there is
+	// no mobileIdentity5GS). firstN1Message buffers the first N1 frame read
+	// by handleRanConnection's attach peek for normal registrations.
+	imsiOverride   string
+	firstN1Message []byte
 }
 
 func NewRanUe(n1Conn net.Conn, ranUeNgapIdGenerator *RanUeNgapIdGenerator) *RanUe {
@@ -103,6 +110,12 @@ func (r *RanUe) GetRanUeId() int64 {
 }
 
 func (r *RanUe) GetMobileIdentityIMSI() string {
+	if r.imsiOverride != "" {
+		return r.imsiOverride
+	}
+	if r.mobileIdentity5GS == nil {
+		return constant.UE_IMSI_PREFIX
+	}
 	suci := r.mobileIdentity5GS.IdStr()
 	parts := strings.Split(suci, "-")
 	if len(parts) < 8 {
