@@ -68,6 +68,10 @@ type RanUe struct {
 	// by handleRanConnection's attach peek for normal registrations.
 	imsiOverride   string
 	firstN1Message []byte
+
+	// handedOver marks that this UE was commanded to re-anchor to another
+	// gNB; the subsequent N1 EOF is expected lifecycle, not an error.
+	handedOver bool
 }
 
 func NewRanUe(n1Conn net.Conn, ranUeNgapIdGenerator *RanUeNgapIdGenerator) *RanUe {

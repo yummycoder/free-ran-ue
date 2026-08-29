@@ -523,7 +523,9 @@ func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64, targetXnIp
 	if err != nil {
 		return nil, fmt.Errorf("marshal ue handover target: %v", err)
 	}
+	ranUe.handedOver = true
 	if _, err := ranUe.GetN1Conn().Write(append([]byte(constant.UE_HANDOVER_COMMAND+" "), targetJson...)); err != nil {
+		ranUe.handedOver = false
 		return nil, fmt.Errorf("send handover command to UE: %v", err)
 	}
 	g.RanLog.Infof("Sent handover command to UE %s (target %s:%d)", hoCtx.Imsi, ack.TargetCpIp, ack.TargetCpPort)

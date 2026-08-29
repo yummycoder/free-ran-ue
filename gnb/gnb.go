@@ -626,7 +626,11 @@ func (g *Gnb) handleRanConnection(ctx context.Context, ranUe *RanUe) {
 			return
 		}
 		if err := g.releaseN1(ranUe); err != nil {
-			g.RanLog.Errorf("Error releasing N1: %v", err)
+			if ranUe.handedOver {
+				g.RanLog.Infof("UE %s re-anchored to new master; releasing local context", ranUe.GetMobileIdentityIMSI())
+			} else {
+				g.RanLog.Errorf("Error releasing N1: %v", err)
+			}
 			return
 		}
 		g.RanLog.Infof("UE %s N1 released", ranUe.GetMobileIdentityIMSI())
@@ -641,7 +645,11 @@ func (g *Gnb) handleRanConnection(ctx context.Context, ranUe *RanUe) {
 	g.GtpLog.Debugf("DL TEID: %s, UL TEID: %s", hex.EncodeToString(ranUe.GetDlTeid()), hex.EncodeToString(ranUe.GetUlTeid()))
 
 	if err := g.releaseN1(ranUe); err != nil {
-		g.RanLog.Errorf("Error releasing N1: %v", err)
+		if ranUe.handedOver {
+			g.RanLog.Infof("UE %s re-anchored to new master; releasing local context", ranUe.GetMobileIdentityIMSI())
+		} else {
+			g.RanLog.Errorf("Error releasing N1: %v", err)
+		}
 		return
 	}
 	g.RanLog.Infof("UE %s N1 released", ranUe.GetMobileIdentityIMSI())
