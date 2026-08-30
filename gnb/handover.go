@@ -621,7 +621,11 @@ func (g *Gnb) completePendingHandover(imsi string, ranUe *RanUe) error {
 		g.notifyHandoverComplete(entry, imsi, XnHandoverAckMsg{Accepted: false, Reason: err.Error()})
 		return fmt.Errorf("send PathSwitchRequest: %v", err)
 	}
-	g.NgapLog.Infoln("Sent PathSwitchRequest (MN->MN', no DC ext) to AMF")
+	if entry.release {
+		g.NgapLog.Infoln("Sent PathSwitchRequest (release: DC ext = self) to AMF")
+	} else {
+		g.NgapLog.Infoln("Sent PathSwitchRequest (MN->MN', no DC ext) to AMF")
+	}
 
 	var ack pathSwitchAckResult
 	select {

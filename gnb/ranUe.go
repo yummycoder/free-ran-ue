@@ -72,6 +72,14 @@ type RanUe struct {
 	// handedOver marks that this UE was commanded to re-anchor to another
 	// gNB; the subsequent N1 EOF is expected lifecycle, not an error.
 	handedOver bool
+
+	// Dynamic-NRDC add targets (batch 4b): when set, the modify-indication
+	// lane dials this Xn peer instead of the configured one, and the UE is
+	// told to dial this data-plane endpoint for its dc leg.
+	dcTargetXnIp   string
+	dcTargetXnPort int
+	dcTargetDpIp   string
+	dcTargetDpPort int
 }
 
 func NewRanUe(n1Conn net.Conn, ranUeNgapIdGenerator *RanUeNgapIdGenerator) *RanUe {

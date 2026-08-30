@@ -40,6 +40,12 @@ type ConsoleGnbUeNrdcModifyRequest struct {
 	Ip   string `json:"ip"`
 	Port int    `json:"port"`
 	Imsi string `json:"imsi"`
+	// TargetXn ("ip:port") selects which gNB to add as the secondary; empty
+	// means the configured Xn peer (upstream behavior). TargetDp ("ip:port")
+	// is that gNB's UE data-plane endpoint, pushed to the UE so it can dial
+	// the new dc leg; empty means the UE's configured dc address.
+	TargetXn string `json:"targetXn,omitempty"`
+	TargetDp string `json:"targetDp,omitempty"`
 }
 
 type ConsoleGnbUeNrdcModifyResponse struct {

@@ -723,6 +723,9 @@ func (u *Ue) waitForRanMessage(ctx context.Context, wg *sync.WaitGroup) {
 			switch {
 			case msg == constant.UE_TUNNEL_UPDATE:
 				go u.updateDataPlane()
+			case strings.HasPrefix(msg, constant.UE_TUNNEL_UPDATE+" "):
+				payload := strings.TrimSpace(msg[len(constant.UE_TUNNEL_UPDATE):])
+				go u.updateDataPlaneTo([]byte(payload))
 			case strings.HasPrefix(msg, constant.UE_HANDOVER_COMMAND):
 				payload := strings.TrimSpace(msg[len(constant.UE_HANDOVER_COMMAND):])
 				go u.performHandover([]byte(payload))
@@ -955,6 +958,63 @@ func (u *Ue) updateDataPlane() {
 		u.nrdc.enable = false
 		u.TunLog.Infoln("Data plane is updated to non-NRDC mode")
 	}
+}
+
+// updateDataPlaneTo activates the dc leg toward a specified gNB data-plane
+// endpoint (dynamic NR-DC addition to a non-configured partner). If a dc
+// connection is already open it is replaced.
+func (u *Ue) updateDataPlaneTo(payload []byte) {
+	var target struct {
+		DpIp   string `json:"dpIp"`
+		DpPort int    `json:"dpPort"`
+	}
+	if err := json.Unmarshal(payload, &target); err != nil {
+		u.TunLog.Errorf("Error unmarshal dc dial payload: %+v", err)
+		return
+	}
+	u.TunLog.Infof("Updating data plane: dc leg to %s:%d", target.DpIp, target.DpPort)
+
+	u.rwLock.Lock()
+	defer u.rwLock.Unlock()
+
+	if u.nrdc.enable && u.dcRanDataPlaneConn != nil {
+		if err := u.dcRanDataPlaneConn.Close(); err != nil {
+			u.UeLog.Warnf("Error closing previous DC RAN connection: %v", err)
+		}
+	}
+
+	conn, err := util.UdpDialWithOptionalLocalAddress(target.DpIp, target.DpPort, u.nrdc.dcLocalDataPlaneIp)
+	if err != nil {
+		u.TunLog.Errorf("Error connect to dc ran data plane: %+v", err)
+		u.nrdc.enable = false
+		return
+	}
+	u.dcRanDataPlaneConn = conn
+
+	if _, err = u.dcRanDataPlaneConn.Write([]byte(constant.UE_DATA_PLANE_INITIAL_PACKET + " " + constant.UE_IMSI_PREFIX + u.supi)); err != nil {
+		u.TunLog.Errorf("Error send initial packet: %+v", err)
+		return
+	}
+	go func() {
+		buffer := make([]byte, 4096)
+		for {
+			n, err := conn.Read(buffer)
+			if err != nil {
+				if errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+					u.TunLog.Debugln("DC RAN data plane connection closed")
+					return
+				}
+				u.RanLog.Errorf("Error read from dc ran data plane: %+v", err)
+				return
+			}
+			tmp := make([]byte, n)
+			copy(tmp, buffer[:n])
+			u.readFromRan <- tmp
+		}
+	}()
+
+	u.nrdc.enable = true
+	u.TunLog.Infoln("Data plane is updated to NRDC mode (dynamic target)")
 }
 
 // performHandover re-anchors the UE to a new master gNB (MN->MN' flow).

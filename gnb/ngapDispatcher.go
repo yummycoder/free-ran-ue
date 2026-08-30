@@ -1,6 +1,7 @@
 package gnb
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -320,17 +321,33 @@ func (d *ngapDispatcher) pduSessionResourceModifyIndicationProcessor(g *Gnb, msg
 		return
 	}
 
-	// send confirm to Xm for update xnUE ULTEID
+	// send confirm to Xn for update xnUE ULTEID
 	if !ranUe.IsNrdcActivated() {
-		if _, err := g.xnPduSessionResourceModifyConfirm(ranUe.GetMobileIdentityIMSI(), ngapRaw); err != nil {
+		xnIp, xnPort := g.xnInterface.xnDialIp, g.xnInterface.xnDialPort
+		if ranUe.dcTargetXnIp != "" {
+			xnIp, xnPort = ranUe.dcTargetXnIp, ranUe.dcTargetXnPort
+		}
+		if _, err := g.xnPduSessionResourceModifyConfirm(ranUe.GetMobileIdentityIMSI(), ngapRaw, xnIp, xnPort); err != nil {
 			g.XnLog.Errorf("Error xn pdu session resource modify confirm: %v", err)
 			return
 		}
 		g.XnLog.Debugln("XN PDU Session Resource Modify Confirm sent")
 	}
 
-	// send modify message to UE
+	// send modify message to UE; when the dc leg targets a non-configured
+	// gNB, append its data-plane endpoint so the UE dials the right place
 	modifyMessage := []byte(constant.UE_TUNNEL_UPDATE)
+	if !ranUe.IsNrdcActivated() && ranUe.dcTargetDpIp != "" {
+		payload, err := json.Marshal(struct {
+			DpIp   string `json:"dpIp"`
+			DpPort int    `json:"dpPort"`
+		}{ranUe.dcTargetDpIp, ranUe.dcTargetDpPort})
+		if err != nil {
+			g.NgapLog.Errorf("Error marshal dc dial payload: %v", err)
+			return
+		}
+		modifyMessage = append([]byte(constant.UE_TUNNEL_UPDATE+" "), payload...)
+	}
 
 	n, err := ranUe.GetN1Conn().Write(modifyMessage)
 	if err != nil {

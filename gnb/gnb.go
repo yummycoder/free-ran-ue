@@ -903,7 +903,11 @@ func (g *Gnb) processUePduSessionModifyIndication(ranUe *RanUe) error {
 	}
 	g.NgapLog.Tracef("Get pdu session modify indication: %+v", pduSessionModifyIndication)
 
-	if pduSessionModifyIndication, err = g.xnPduSessionResourceModifyIndication(ranUe.GetMobileIdentityIMSI(), pduSessionModifyIndication); err != nil {
+	xnIp, xnPort := g.xnInterface.xnDialIp, g.xnInterface.xnDialPort
+	if ranUe.dcTargetXnIp != "" {
+		xnIp, xnPort = ranUe.dcTargetXnIp, ranUe.dcTargetXnPort
+	}
+	if pduSessionModifyIndication, err = g.xnPduSessionResourceModifyIndication(ranUe.GetMobileIdentityIMSI(), pduSessionModifyIndication, xnIp, xnPort); err != nil {
 		g.XnLog.Errorf("Error xn pdu session resource modify indication: %v", err)
 		return fmt.Errorf("error xn pdu session resource modify indication: %v", err)
 	}
@@ -1010,10 +1014,10 @@ func (g *Gnb) xnPduSessionResourceSetupRequestTransfer(imsi string, ngapPduSessi
 	return qosFlowPerTNLInformationItem, nil
 }
 
-func (g *Gnb) xnPduSessionResourceModifyIndication(imsi string, ngapPduSessionResourceModifyIndicationRaw []byte) ([]byte, error) {
+func (g *Gnb) xnPduSessionResourceModifyIndication(imsi string, ngapPduSessionResourceModifyIndicationRaw []byte, xnDialIp string, xnDialPort int) ([]byte, error) {
 	g.XnLog.Infoln("Processing XN PDU Session Resource Modify Indication Transfer")
 
-	xnConn, err := util.TcpDialWithOptionalLocalAddress(g.xnInterface.xnDialIp, g.xnInterface.xnDialPort, "")
+	xnConn, err := util.TcpDialWithOptionalLocalAddress(xnDialIp, xnDialPort, "")
 	if err != nil {
 		return nil, fmt.Errorf("error dial xn: %v", err)
 	}
@@ -1060,14 +1064,14 @@ func (g *Gnb) xnPduSessionResourceModifyIndication(imsi string, ngapPduSessionRe
 	return xnPdu.Data, nil
 }
 
-func (g *Gnb) xnPduSessionResourceModifyConfirm(imsi string, ngapPduSessionResourceModifyConfirmRaw []byte) ([]byte, error) {
+func (g *Gnb) xnPduSessionResourceModifyConfirm(imsi string, ngapPduSessionResourceModifyConfirmRaw []byte, xnDialIp string, xnDialPort int) ([]byte, error) {
 	g.XnLog.Infoln("Processing XN PDU Session Resource Modify Confirm")
 
-	xnConn, err := util.TcpDialWithOptionalLocalAddress(g.xnInterface.xnDialIp, g.xnInterface.xnDialPort, "")
+	xnConn, err := util.TcpDialWithOptionalLocalAddress(xnDialIp, xnDialPort, "")
 	if err != nil {
 		return nil, fmt.Errorf("error dial xn: %v", err)
 	}
-	g.XnLog.Debugf("Dial XN at %s:%d", g.xnInterface.xnDialIp, g.xnInterface.xnDialPort)
+	g.XnLog.Debugf("Dial XN at %s:%d", xnDialIp, xnDialPort)
 
 	xnPdu := NewXnPdu(imsi, ngapPduSessionResourceModifyConfirmRaw)
 	xnPduBytes, err := xnPdu.Marshal()
@@ -1250,6 +1254,33 @@ func (g *Gnb) handleConsoleGnbUeNrdcModify(c *gin.Context) {
 		})
 		return
 	}
+	if request.TargetXn != "" {
+		host, portStr, err := net.SplitHostPort(request.TargetXn)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, consoleModel.ConsoleGnbUeNrdcModifyResponse{
+				Message: fmt.Sprintf("Invalid targetXn %q: %v", request.TargetXn, err),
+			})
+			return
+		}
+		port, _ := strconv.Atoi(portStr)
+		ranUe.dcTargetXnIp, ranUe.dcTargetXnPort = host, port
+	} else {
+		ranUe.dcTargetXnIp, ranUe.dcTargetXnPort = "", 0
+	}
+	if request.TargetDp != "" {
+		host, portStr, err := net.SplitHostPort(request.TargetDp)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, consoleModel.ConsoleGnbUeNrdcModifyResponse{
+				Message: fmt.Sprintf("Invalid targetDp %q: %v", request.TargetDp, err),
+			})
+			return
+		}
+		port, _ := strconv.Atoi(portStr)
+		ranUe.dcTargetDpIp, ranUe.dcTargetDpPort = host, port
+	} else {
+		ranUe.dcTargetDpIp, ranUe.dcTargetDpPort = "", 0
+	}
+
 	if err := g.processUePduSessionModifyIndication(ranUe); err != nil {
 		g.ApiLog.Errorf("Error process ue pdu session modify indication: %v", err)
 		c.JSON(http.StatusInternalServerError, consoleModel.ConsoleGnbUeNrdcModifyResponse{
