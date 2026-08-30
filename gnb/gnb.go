@@ -920,11 +920,42 @@ func (g *Gnb) processUePduSessionModifyIndication(ranUe *RanUe) error {
 	g.NgapLog.Tracef("Sent %d bytes of pdu session modify indication to AMF", n)
 	g.NgapLog.Debugln("Send PDU Session Modify Indication to AMF")
 
-	// wait dispatcher to receive ngap pdu session resource setup request from AMF
+	// wait for the dispatcher to process the confirm from the AMF
 
-	<-ranUe.GetPduSessionModifyIndicationCompleteChan()
+	select {
+	case <-ranUe.GetPduSessionModifyIndicationCompleteChan():
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("timeout waiting for PDU Session Resource Modify Confirm")
+	}
 	g.NgapLog.Infof("UE %s PDU session modify indication completed", ranUe.GetMobileIdentityIMSI())
 	return nil
+}
+
+// sendDcReleaseIndication sends a PDU Session Resource Modify Indication
+// WITHOUT the DC extension straight to the AMF (no Xn relay - there is no
+// partner to involve). With the SMF release fix this removes the secondary
+// leg's rules at the UPF; the confirm makes the dispatcher push
+// UE_TUNNEL_UPDATE (dc teardown) and deactivate NRDC on the RanUe.
+func (g *Gnb) sendDcReleaseIndication(ranUe *RanUe) error {
+	transfer, err := getPDUSessionResourceModifyIndicationTransfer(ranUe.GetDlTeid(), g.ranN3Ip, 1)
+	if err != nil {
+		return fmt.Errorf("build modify indication transfer: %v", err)
+	}
+	indication, err := getPDUSessionResourceModifyIndication(ranUe.GetAmfUeId(), ranUe.GetRanUeId(), constant.PDU_SESSION_ID, transfer)
+	if err != nil {
+		return fmt.Errorf("build modify indication: %v", err)
+	}
+	if _, err := g.n2Conn.Write(indication); err != nil {
+		return fmt.Errorf("send modify indication: %v", err)
+	}
+	g.NgapLog.Infoln("Sent PDU Session Resource Modify Indication (DC release) to AMF")
+
+	select {
+	case <-ranUe.GetPduSessionModifyIndicationCompleteChan():
+		return nil
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("timeout waiting for PDU Session Resource Modify Confirm")
+	}
 }
 
 func (g *Gnb) processUeDeRegistration(ranUe *RanUe) error {

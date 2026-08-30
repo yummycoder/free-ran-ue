@@ -655,13 +655,26 @@ func (g *Gnb) completePendingHandover(imsi string, ranUe *RanUe) error {
 			}
 			return true
 		})
-		// The UE's dc connection (to this gNB) is redundant now - the
-		// existing UE_TUNNEL_UPDATE toggle closes it and clears NRDC state.
-		if _, err := ranUe.GetN1Conn().Write([]byte(constant.UE_TUNNEL_UPDATE)); err != nil {
-			g.RanLog.Warnf("Error sending tunnel update (dc teardown) to UE %s: %v", imsi, err)
+		g.XnLog.Infof("Secondary collapsed onto this gNB for UE %s; requesting DC release at the core", imsi)
+
+		// Real removal: modify indication without the DC ext -> SMF removes
+		// the secondary leg's PDR/FARs (UPF prunes its DL path cache) ->
+		// confirm -> dispatcher pushes UE_TUNNEL_UPDATE (UE closes its dc
+		// connection) and deactivates NRDC. If the core does not support
+		// release (unpatched SMF), we time out and stay in the collapsed
+		// state, which is still fully functional.
+		if err := g.sendDcReleaseIndication(ranUe); err != nil {
+			g.XnLog.Warnf("DC release at core failed for UE %s (%v); keeping collapsed DC (both slots on this gNB)", imsi, err)
+			if _, werr := ranUe.GetN1Conn().Write([]byte(constant.UE_TUNNEL_UPDATE)); werr != nil {
+				g.RanLog.Warnf("Error sending tunnel update (dc teardown) to UE %s: %v", imsi, werr)
+			}
+			ranUe.DeactivateNrdc()
+		} else {
+			// the second-slot TEID no longer exists at the core: unmap and free it
+			g.dlTeidToUe.Delete(hex.EncodeToString(dcSelfTeid))
+			g.teidGenerator.ReleaseTeid(dcSelfTeid)
+			g.XnLog.Infof("Secondary fully released for UE %s: DC rules removed at the core, single tunnel remains", imsi)
 		}
-		ranUe.DeactivateNrdc()
-		g.XnLog.Infof("Secondary released for UE %s: DC collapsed onto this gNB, old partner will self-reap", imsi)
 	}
 
 	g.notifyHandoverComplete(entry, imsi, XnHandoverAckMsg{

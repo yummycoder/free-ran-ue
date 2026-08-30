@@ -366,5 +366,9 @@ func (d *ngapDispatcher) pduSessionResourceModifyIndicationProcessor(g *Gnb, msg
 		g.NgapLog.Infof("UE %s NRDC activated", ranUe.GetMobileIdentityIMSI())
 	}
 
-	ranUe.GetPduSessionModifyIndicationCompleteChan() <- struct{}{}
+	select {
+	case ranUe.GetPduSessionModifyIndicationCompleteChan() <- struct{}{}:
+	default:
+		// no waiter (it timed out or none was registered): never block the dispatcher
+	}
 }
