@@ -44,6 +44,9 @@ type XnHandoverContext struct {
 	SecondaryDlTeid   string `json:"secDlTeid"` // DL TEID of the leg that stays/becomes secondary
 	SecondaryN3Ip     string `json:"secN3Ip"`   // N3 address of that secondary leg
 	PduSessionId      int64  `json:"pduSessionId"`
+	// ReleaseSecondary requests the deferred flow with post-switch collapse of
+	// the DC leg onto the target (see completePendingHandover).
+	ReleaseSecondary bool `json:"releaseSecondary,omitempty"`
 }
 
 // XnHandoverAckMsg is the target's answer: where the UE should re-anchor.
@@ -77,6 +80,7 @@ type ueHandoverTarget struct {
 type pendingHandoverEntry struct {
 	ctx          XnHandoverContext
 	xnConn       net.Conn // held open for the XnTypeHandoverComplete reply (deferred flow)
+	release      bool     // swap-with-release: collapse the secondary onto this gNB after the switch
 	targetDlTeid []byte
 	ranUeNgapId  int64
 }
@@ -264,18 +268,20 @@ func xnHandoverRequestProcessor(g *Gnb, conn net.Conn, xnPdu *XnPdu) {
 	g.XnLog.Infof("Handover target DL TEID %s (reused existing leg: %v)",
 		hex.EncodeToString(targetDlTeid), reusedLeg)
 
-	if !reusedLeg {
-		// MN->MN' (no existing leg here): two-phase. The UE's data-plane
-		// socket is connected to the old master, so DL delivered here would
-		// be undeliverable until the UE re-anchors. Prepare, ack with our
-		// endpoints, and only send the PathSwitchRequest once the UE has
-		// attached (completePendingHandover). Make-before-break.
+	if !reusedLeg || hoCtx.ReleaseSecondary {
+		// Deferred (two-phase) flow. Taken for MN->MN' (no existing leg: DL
+		// delivered here would be undeliverable until the UE re-anchors) and
+		// for swap-with-release (existing leg reused, but the UE must
+		// re-anchor before the switch so the old master can be fully
+		// released afterwards). Prepare, ack with our endpoints, and only
+		// send the PathSwitchRequest once the UE has attached.
 		g.ranUeNgapIdGenerator.ReleaseRanUeId(ranUeNgapId) // attach conn brings its own
 		g.pendingHandover.Store(hoCtx.Imsi, &pendingHandoverEntry{
 			ctx:          hoCtx,
 			xnConn:       conn,
 			targetDlTeid: targetDlTeid,
 			ranUeNgapId:  -1,
+			release:      hoCtx.ReleaseSecondary,
 		})
 		xnHandoverReply(g, conn, hoCtx.Imsi, XnHandoverAckMsg{
 			Accepted:     true,
@@ -363,9 +369,10 @@ func xnHandoverReply(g *Gnb, conn net.Conn, imsi string, ack XnHandoverAckMsg) {
 // ---------------------------------------------------------------------------
 
 type ConsoleGnbUeHandoverRequest struct {
-	Imsi         string `json:"imsi" binding:"required"`
-	PduSessionId int64  `json:"pduSessionId"`
-	TargetXn     string `json:"targetXn,omitempty"`
+	Imsi             string `json:"imsi" binding:"required"`
+	PduSessionId     int64  `json:"pduSessionId"`
+	TargetXn         string `json:"targetXn,omitempty"`
+	ReleaseSecondary bool   `json:"releaseSecondary,omitempty"`
 }
 
 type ConsoleGnbUeHandoverResponse struct {
@@ -420,7 +427,7 @@ func (g *Gnb) handleConsoleGnbUeHandover(c *gin.Context) {
 		return
 	}
 
-	ack, err := g.processMnToSnHandover(ranUe, request.PduSessionId, targetXnIp, targetXnPort)
+	ack, err := g.processMnToSnHandover(ranUe, request.PduSessionId, targetXnIp, targetXnPort, request.ReleaseSecondary)
 	if err != nil {
 		g.ApiLog.Errorf("Error process handover: %v", err)
 		c.JSON(http.StatusInternalServerError, ConsoleGnbUeHandoverResponse{
@@ -439,7 +446,7 @@ func (g *Gnb) handleConsoleGnbUeHandover(c *gin.Context) {
 // processMnToSnHandover transfers the UE context to the Xn peer (the current
 // secondary), which performs the path switch and becomes the new master.
 // This gNB keeps serving its leg, now as the secondary.
-func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64, targetXnIp string, targetXnPort int) (*XnHandoverAckMsg, error) {
+func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64, targetXnIp string, targetXnPort int, releaseSecondary bool) (*XnHandoverAckMsg, error) {
 	if targetXnIp == "" {
 		targetXnIp = g.xnInterface.xnDialIp
 		targetXnPort = g.xnInterface.xnDialPort
@@ -455,6 +462,7 @@ func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64, targetXnIp
 		SecondaryDlTeid:   hex.EncodeToString(ranUe.GetDlTeid()),
 		SecondaryN3Ip:     g.ranN3Ip,
 		PduSessionId:      pduSessionId,
+		ReleaseSecondary:  releaseSecondary,
 	}
 	payload, err := json.Marshal(hoCtx)
 	if err != nil {
@@ -585,10 +593,26 @@ func (g *Gnb) completePendingHandover(imsi string, ranUe *RanUe) error {
 	g.pathSwitchAckChans.Store(ranUe.GetRanUeId(), ackChan)
 	defer g.pathSwitchAckChans.Delete(ranUe.GetRanUeId())
 
+	// Swap-with-release: the DC FAR currently points at the old master's
+	// leg, which is about to disappear. The SMF has no DC-removal path
+	// (HandlePDUSessionResourceModifyIndicationTransfer never clears DC
+	// state), but it DOES update the DC tunnel whenever the PathSwitch ext
+	// is present - so the release is realized as a repoint: the ext names a
+	// second TEID on THIS gNB, collapsing both hash slots onto the survivor.
+	var dcSelfTeid []byte
+	includeDcExt := false
+	secondaryN3Ip := ""
+	if entry.release {
+		dcSelfTeid = g.teidGenerator.AllocateTeid()
+		includeDcExt = true
+		secondaryN3Ip = g.ranN3Ip
+		g.XnLog.Infof("Release mode: collapsing secondary onto this gNB (second DL TEID %s)",
+			hex.EncodeToString(dcSelfTeid))
+	}
 	psRaw, err := g.buildPathSwitchRequestWithDC(
-		false,
+		includeDcExt,
 		ranUe.GetRanUeId(), entry.ctx.AmfUeNgapId, entry.ctx.PduSessionId,
-		ranUe.GetDlTeid(), nil, "")
+		ranUe.GetDlTeid(), dcSelfTeid, secondaryN3Ip)
 	if err != nil {
 		g.notifyHandoverComplete(entry, imsi, XnHandoverAckMsg{Accepted: false, Reason: err.Error()})
 		return fmt.Errorf("build PathSwitchRequest: %v", err)
@@ -613,6 +637,29 @@ func (g *Gnb) completePendingHandover(imsi string, ranUe *RanUe) error {
 	if len(ack.ulPrimaryTeid) > 0 {
 		ranUe.SetUlTeid(ack.ulPrimaryTeid)
 	}
+
+	if entry.release {
+		// Both DL hash slots now terminate here: map the second TEID to the
+		// same UE so either slot delivers.
+		g.dlTeidToUe.Store(hex.EncodeToString(dcSelfTeid), ranUe)
+		// Drop the XnUe bookkeeping WITHOUT releasing its TEID - that TEID
+		// is now the RanUe's primary and is freed with the RanUe.
+		g.xnUeConns.Range(func(key, _ any) bool {
+			if xnUe, ok := key.(*XnUe); ok && xnUe.GetIMSI() == imsi {
+				g.xnUeConns.Delete(key)
+				return false
+			}
+			return true
+		})
+		// The UE's dc connection (to this gNB) is redundant now - the
+		// existing UE_TUNNEL_UPDATE toggle closes it and clears NRDC state.
+		if _, err := ranUe.GetN1Conn().Write([]byte(constant.UE_TUNNEL_UPDATE)); err != nil {
+			g.RanLog.Warnf("Error sending tunnel update (dc teardown) to UE %s: %v", imsi, err)
+		}
+		ranUe.DeactivateNrdc()
+		g.XnLog.Infof("Secondary released for UE %s: DC collapsed onto this gNB, old partner will self-reap", imsi)
+	}
+
 	g.notifyHandoverComplete(entry, imsi, XnHandoverAckMsg{
 		Accepted:      true,
 		UlPrimaryTeid: hex.EncodeToString(ack.ulPrimaryTeid),
