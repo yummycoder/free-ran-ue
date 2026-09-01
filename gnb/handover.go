@@ -745,7 +745,7 @@ func (g *Gnb) processHandoverAttach(ranUe *RanUe, imsi string) error {
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timeout waiting for UE %s data plane initial packet", imsi)
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(500 * time.Microsecond)
 	}
 	if _, err := ranUe.GetN1Conn().Write([]byte(constant.UE_HANDOVER_READY)); err != nil {
 		return fmt.Errorf("send handover ready to UE: %v", err)

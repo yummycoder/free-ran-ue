@@ -1040,10 +1040,6 @@ func (u *Ue) performHandover(payload []byte) {
 		u.RanLog.Errorf("Error dial new ran data plane: %+v", err)
 		return
 	}
-	if _, err := newDp.Write([]byte(constant.UE_DATA_PLANE_INITIAL_PACKET + " " + constant.UE_IMSI_PREFIX + u.supi)); err != nil {
-		u.RanLog.Errorf("Error send initial packet to new ran data plane: %+v", err)
-		return
-	}
 	go func() {
 		buffer := make([]byte, 4096)
 		for {
@@ -1072,6 +1068,13 @@ func (u *Ue) performHandover(payload []byte) {
 	}
 	if _, err := newCp.Write([]byte(constant.UE_HANDOVER_ATTACH + " " + constant.UE_IMSI_PREFIX + u.supi)); err != nil {
 		u.RanLog.Errorf("Error send handover attach: %+v", err)
+		return
+	}
+	// Send the data-plane initial packet AFTER the attach line: the target
+	// stores the IMSI maps synchronously when the attach lands, so the
+	// initial packet wires on its first lookup instead of a retry cycle.
+	if _, err := newDp.Write([]byte(constant.UE_DATA_PLANE_INITIAL_PACKET + " " + constant.UE_IMSI_PREFIX + u.supi)); err != nil {
+		u.RanLog.Errorf("Error send initial packet to new ran data plane: %+v", err)
 		return
 	}
 

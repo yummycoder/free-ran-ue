@@ -682,14 +682,17 @@ func (g *Gnb) startDataPlaneProcessor() {
 
 func (g *Gnb) handleUeDataPlaneInitialPacket(ueAddress *net.UDPAddr, imsi string) {
 	var dlTeidAndUeTypeInstance dlTeidAndUeType
+	// Poll at 1ms (same 10s budget): during a handover attach the map is
+	// stored microseconds after the CP line lands, and a coarse 100ms sleep
+	// here was the dominant term in the handover barrier (~100ms).
 	for try := 0; ; try += 1 {
 		dlTeidAndUeTypeValue, exists := g.imsiTodlTeidAndUeType.Load(imsi)
 		if !exists {
-			if try == 100 {
+			if try == 10000 {
 				g.RanLog.Errorf("No DL TEID and UE type found for IMSI: %s", imsi)
 				return
 			}
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(1 * time.Millisecond)
 		} else {
 			dlTeidAndUeTypeInstance = dlTeidAndUeTypeValue.(dlTeidAndUeType)
 			break
