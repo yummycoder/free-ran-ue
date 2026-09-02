@@ -29,7 +29,9 @@ const (
 	UE_TUNNEL_UPDATE             = "tunnel update"
 	UE_HANDOVER_COMMAND          = "handover command"
 	UE_HANDOVER_ATTACH           = "handover attach"
-	UE_HANDOVER_READY            = "handover ready"
+	UE_HANDOVER_READY            = "handover ready"  // target prepared; UE must KEEP the old path
+	UE_HANDOVER_COMMIT           = "handover commit" // core switched; UE may swap and close the old path
+	UE_HANDOVER_ABORT            = "handover abort"  // switch failed; UE closes the new path, keeps the old
 	UE_IMSI_PREFIX               = "imsi-"
 )
 
