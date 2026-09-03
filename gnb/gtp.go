@@ -156,6 +156,18 @@ func forwardPacketToUe(gtpPacket []byte, ranDataPlaneServer *net.UDPConn, dlTeid
 	switch u := ue.(type) {
 	case *RanUe:
 		gnbLogger.GtpLog.Debugf("Loaded UE %s for DL TEID: %s", u.GetMobileIdentityIMSI(), teid)
+		if fwd := u.ForwardConn(); fwd != nil {
+			frame := NewTypedXnPdu(XnTypeForward, u.GetMobileIdentityIMSI(), payload)
+			raw, mErr := frame.Marshal()
+			if mErr != nil {
+				gnbLogger.GtpLog.Warnf("Error marshal forwarded frame: %v", mErr)
+				return
+			}
+			if _, wErr := fwd.Write(raw); wErr != nil {
+				gnbLogger.GtpLog.Warnf("Error forwarding DL to target: %v", wErr)
+			}
+			return
+		}
 		dataPlaneAddress := u.GetDataPlaneAddress()
 		if dataPlaneAddress == nil {
 			gnbLogger.GtpLog.Warnf("RAN UE %s data plane address not set yet, dropping packet", u.GetMobileIdentityIMSI())

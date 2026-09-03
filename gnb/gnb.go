@@ -89,6 +89,7 @@ type Gnb struct {
 	addressToUe           sync.Map // UDP address -> *(Ran/Xn)Ue
 	imsiTodlTeidAndUeType sync.Map // imsi -> dlTeidAndUeType
 	pendingHandover       sync.Map // imsi -> *pendingHandoverEntry (handover target side)
+	forwardBuffer         sync.Map // imsi -> *forwardQueue (target: buffered forwarded DL)
 	pathSwitchAckChans    sync.Map // ranUeNgapId -> chan pathSwitchAckResult
 
 	gtpChannel chan []byte
@@ -711,6 +712,7 @@ func (g *Gnb) handleUeDataPlaneInitialPacket(ueAddress *net.UDPAddr, imsi string
 	case constant.UE_TYPE_RAN:
 		ue.(*RanUe).SetDataPlaneAddress(ueAddress)
 		g.addressToUe.Store(ueAddress.String(), ue)
+		g.flushForwardedPackets(imsi, ueAddress)
 		g.RanLog.Infof("Set data plane address %s for UE: %s", ueAddress.String(), ue.(*RanUe).GetMobileIdentityIMSI())
 	case constant.UE_TYPE_XN:
 		ue.(*XnUe).SetDataPlaneAddress(ueAddress)

@@ -73,6 +73,11 @@ type RanUe struct {
 	// gNB; the subsequent N1 EOF is expected lifecycle, not an error.
 	handedOver bool
 
+	// Data-forwarding baseline: while a handover is in flight the source
+	// relays this UE's DL to the target over this Xn conn instead of dropping.
+	forwardConn net.Conn
+	forwardMtx  sync.Mutex
+
 	// Dynamic-NRDC add targets (batch 4b): when set, the modify-indication
 	// lane dials this Xn peer instead of the configured one, and the UE is
 	// told to dial this data-plane endpoint for its dc leg.
@@ -119,6 +124,24 @@ func (r *RanUe) GetAmfUeId() int64 {
 
 func (r *RanUe) GetRanUeId() int64 {
 	return r.ranUeNgapId
+}
+
+func (r *RanUe) StartForwarding(conn net.Conn) {
+	r.forwardMtx.Lock()
+	r.forwardConn = conn
+	r.forwardMtx.Unlock()
+}
+
+func (r *RanUe) ForwardConn() net.Conn {
+	r.forwardMtx.Lock()
+	defer r.forwardMtx.Unlock()
+	return r.forwardConn
+}
+
+func (r *RanUe) StopForwarding() {
+	r.forwardMtx.Lock()
+	r.forwardConn = nil
+	r.forwardMtx.Unlock()
 }
 
 func (r *RanUe) GetMobileIdentityIMSI() string {

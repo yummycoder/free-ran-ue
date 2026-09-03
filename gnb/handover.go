@@ -32,6 +32,7 @@ const (
 	XnTypeHandoverRequest  byte = 1
 	XnTypeHandoverAck      byte = 2
 	XnTypeHandoverComplete byte = 3
+	XnTypeForward          byte = 4 // forwarded DL user data (source MN -> target MN during handover)
 )
 
 // XnHandoverContext is the UE context the source gNB transfers to the
@@ -531,6 +532,27 @@ func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64, targetXnIp
 	if err != nil {
 		return nil, fmt.Errorf("marshal ue handover target: %v", err)
 	}
+	fwdConn, fwdErr := util.TcpDialWithOptionalLocalAddress(targetXnIp, targetXnPort, "")
+	if fwdErr != nil {
+		g.XnLog.Warnf("Could not open forwarding conn (continuing without): %v", fwdErr)
+	} else {
+		primer := NewTypedXnPdu(XnTypeForward, hoCtx.Imsi, []byte{})
+		if raw, mErr := primer.Marshal(); mErr == nil {
+			if _, wErr := fwdConn.Write(raw); wErr == nil {
+				ranUe.StartForwarding(fwdConn)
+				g.XnLog.Infof("Data forwarding to target started for UE %s", hoCtx.Imsi)
+				defer func() {
+					if fc := ranUe.ForwardConn(); fc != nil {
+						ranUe.StopForwarding()
+						if cerr := fc.Close(); cerr != nil {
+							g.XnLog.Debugf("Close forwarding conn: %v", cerr)
+						}
+					}
+				}()
+			}
+		}
+	}
+
 	ranUe.handedOver = true
 	if _, err := ranUe.GetN1Conn().Write(append([]byte(constant.UE_HANDOVER_COMMAND+" "), targetJson...)); err != nil {
 		ranUe.handedOver = false

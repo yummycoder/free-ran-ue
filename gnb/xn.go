@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"sync"
 
 	"github.com/free-ran-ue/free-ran-ue/v2/constant"
 	"github.com/free5gc/ngap/aper"
@@ -92,6 +93,9 @@ func xnInterfaceProcessor(conn net.Conn, g *Gnb) {
 		return
 	case XnTypeHandoverAck:
 		g.XnLog.Warnln("Unexpected XN Handover Ack on listener")
+		return
+	case XnTypeForward:
+		xnForwardProcessor(g, conn, &xnPdu)
 		return
 	}
 
@@ -399,4 +403,80 @@ func xnReleaseUeProcessor(g *Gnb, conn net.Conn, imsi string) bool {
 	g.XnLog.Debugf("Deleted XN UE %s from xnUeConns", xnUe.GetIMSI())
 
 	return true
+}
+
+// xnForwardProcessor receives forwarded DL from the source MN and buffers it
+// per IMSI until the UE attaches here, then flushForwardedPackets drains it
+// ahead of live traffic. The first frame is parsed; the rest stream off conn.
+func xnForwardProcessor(g *Gnb, conn net.Conn, first *XnPdu) {
+	g.XnLog.Infof("Receiving forwarded DL for UE %s", first.Imsi)
+	g.bufferForwardedPacket(first.Imsi, first.Data)
+	buffer := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buffer)
+		if err != nil {
+			g.XnLog.Infof("Forwarded DL stream for UE %s ended: %v", first.Imsi, err)
+			return
+		}
+		pdu := XnPdu{}
+		if err := pdu.Unmarshal(buffer[:n]); err != nil {
+			g.XnLog.Warnf("Error unmarshal forwarded frame: %v", err)
+			continue
+		}
+		if pdu.Type != XnTypeForward {
+			g.XnLog.Warnf("Unexpected frame type %d on forward stream", pdu.Type)
+			continue
+		}
+		g.bufferForwardedPacket(pdu.Imsi, pdu.Data)
+	}
+}
+
+type forwardQueue struct {
+	mu      sync.Mutex
+	ready   bool
+	addr    *net.UDPAddr
+	packets [][]byte
+}
+
+// bufferForwardedPacket appends under the queue lock, or delivers live if the
+// buffer has already been flushed. One lock guards ready+packets so a packet
+// can never land in an already-drained queue.
+func (g *Gnb) bufferForwardedPacket(imsi string, payload []byte) {
+	if len(payload) == 0 {
+		return // primer frame
+	}
+	actual, _ := g.forwardBuffer.LoadOrStore(imsi, &forwardQueue{})
+	q := actual.(*forwardQueue)
+	q.mu.Lock()
+	if q.ready {
+		addr := q.addr
+		q.mu.Unlock()
+		if addr != nil {
+			if _, err := g.ranDataPlaneServer.WriteToUDP(payload, addr); err != nil {
+				g.XnLog.Warnf("Error delivering live forwarded packet: %v", err)
+			}
+		}
+		return
+	}
+	q.packets = append(q.packets, payload)
+	q.mu.Unlock()
+}
+
+// flushForwardedPackets drains buffered payloads in order and flips ready
+// under the same lock, so no packet appended concurrently is lost.
+func (g *Gnb) flushForwardedPackets(imsi string, addr *net.UDPAddr) {
+	actual, _ := g.forwardBuffer.LoadOrStore(imsi, &forwardQueue{})
+	q := actual.(*forwardQueue)
+	q.mu.Lock()
+	pkts := q.packets
+	q.packets = nil
+	q.addr = addr
+	q.ready = true
+	for _, p := range pkts {
+		if _, err := g.ranDataPlaneServer.WriteToUDP(p, addr); err != nil {
+			g.XnLog.Warnf("Error flushing forwarded packet: %v", err)
+		}
+	}
+	q.mu.Unlock()
+	g.XnLog.Infof("Flushed %d forwarded packets for UE %s", len(pkts), imsi)
 }
