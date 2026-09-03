@@ -66,6 +66,14 @@ type nrdc struct {
 }
 
 type Ue struct {
+	// handoverInProgress: during a plain Xn handover the master bearer is
+	// interrupted (break-before-make). The uplink writer drops master-bound
+	// packets while this is set - modelling the Uu interruption - but keeps
+	// running, so it resumes on the new socket after the swap and TCP can
+	// retransmit the lost packets. It is NOT buffered/replayed.
+	handoverInProgress bool
+	handoverMtx        sync.Mutex
+
 	ranControlPlaneIp string
 	ranDataPlaneIp    string
 	localDataPlaneIp  string
@@ -854,6 +862,9 @@ func (u *Ue) handleDataPlane(ctx context.Context, wg *sync.WaitGroup) {
 			goto HANDLE_DATA_PLANE_FINISH
 		case buffer := <-u.readFromTun:
 			if !u.isNrdcEnabled() {
+				if u.isHandoverInProgress() {
+					continue // master bearer interrupted; drop, keep the writer alive
+				}
 				conn := u.ranDataPlaneConn
 				n, err := conn.Write(buffer)
 				if err != nil {
@@ -881,6 +892,9 @@ func (u *Ue) handleDataPlane(ctx context.Context, wg *sync.WaitGroup) {
 					}
 					u.RanLog.Tracef("Sent %d bytes of data to DC RAN: %+v", n, buffer[:n])
 				} else {
+					if u.isHandoverInProgress() {
+						continue // master bearer interrupted; drop, keep the writer alive
+					}
 					conn := u.ranDataPlaneConn
 					n, err := conn.Write(buffer)
 					if err != nil {
@@ -1021,6 +1035,18 @@ func (u *Ue) updateDataPlaneTo(payload []byte) {
 // Order is make-before-break: dial the new data plane and announce the IMSI,
 // dial the new control plane and attach (which triggers the target's
 // PathSwitchRequest), swap the connections, then close the old ones.
+func (u *Ue) setHandoverInProgress(v bool) {
+	u.handoverMtx.Lock()
+	u.handoverInProgress = v
+	u.handoverMtx.Unlock()
+}
+
+func (u *Ue) isHandoverInProgress() bool {
+	u.handoverMtx.Lock()
+	defer u.handoverMtx.Unlock()
+	return u.handoverInProgress
+}
+
 func (u *Ue) performHandover(payload []byte) {
 	var target struct {
 		CpIp   string `json:"cpIp"`
@@ -1034,6 +1060,30 @@ func (u *Ue) performHandover(payload []byte) {
 	}
 	u.RanLog.Infof("Handover command: re-anchoring to CP %s:%d, DP %s:%d",
 		target.CpIp, target.CpPort, target.DpIp, target.DpPort)
+
+	// Plain Xn handover (break-before-make): mark handover BEFORE touching the
+	// socket so the uplink writer drops master-bound packets instead of
+	// writing to a closing socket (which would return ErrClosed and kill the
+	// writer goroutine). Then detach the source data plane. Master-bound
+	// uplink is dropped for the interruption - TCP retransmits afterward; the
+	// writer never exits. DC-bound uplink is unaffected.
+	u.setHandoverInProgress(true)
+	// Guarantee the flag is cleared on every exit path. On success it is
+	// cleared explicitly at the swap (writer resumes on newDp); on any early
+	// return this defer clears it so uplink is never left permanently dropped.
+	handoverDone := false
+	defer func() {
+		if !handoverDone {
+			u.setHandoverInProgress(false)
+		}
+	}()
+	u.rwLock.Lock()
+	oldDp := u.ranDataPlaneConn
+	u.rwLock.Unlock()
+	if err := oldDp.Close(); err != nil {
+		u.RanLog.Warnf("Error detaching old data plane: %+v", err)
+	}
+	u.RanLog.Infoln("Detached from source data plane (Xn handover, break-before-make)")
 
 	newDp, err := util.UdpDialWithOptionalLocalAddress(target.DpIp, target.DpPort, u.localDataPlaneIp)
 	if err != nil {
@@ -1105,14 +1155,16 @@ func (u *Ue) performHandover(payload []byte) {
 
 	u.rwLock.Lock()
 	oldCp := u.ranControlPlaneConn
-	oldDp := u.ranDataPlaneConn
 	u.ranControlPlaneConn = newCp
 	u.ranDataPlaneConn = newDp
 	u.rwLock.Unlock()
 
-	if err := oldDp.Close(); err != nil {
-		u.RanLog.Warnf("Error close old data plane: %+v", err)
-	}
+	// New socket installed and target address wired (ready barrier passed):
+	// resume uplink. The writer now sends through newDp.
+	u.setHandoverInProgress(false)
+	handoverDone = true
+
+	// old data plane already closed at detach; release the control plane.
 	if err := oldCp.Close(); err != nil {
 		u.RanLog.Warnf("Error close old control plane: %+v", err)
 	}
