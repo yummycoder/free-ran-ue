@@ -543,7 +543,6 @@ func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64, targetXnIp
 	}
 	n, err = xnConn.Read(buffer)
 	if err != nil {
-		ranUe.handedOver = false
 		return nil, fmt.Errorf("read handover complete from xn: %v", err)
 	}
 	completePdu := &XnPdu{}
@@ -558,9 +557,6 @@ func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64, targetXnIp
 		return nil, fmt.Errorf("unmarshal handover complete: %v", err)
 	}
 	if !complete.Accepted {
-		// The UE kept (or returned to) the old path - this gNB still serves
-		// it, so a later N1 EOF would be a real error again.
-		ranUe.handedOver = false
 		return nil, fmt.Errorf("handover failed at target: %s", complete.Reason)
 	}
 
@@ -638,24 +634,8 @@ func (g *Gnb) completePendingHandover(imsi string, ranUe *RanUe) error {
 		ack.err = fmt.Errorf("timeout waiting for PathSwitchRequestAcknowledge")
 	}
 	if ack.err != nil {
-		// The core did not switch: tell the UE to discard the new path and
-		// stay on the old master, then report the failure to the source.
-		if _, werr := ranUe.GetN1Conn().Write([]byte(constant.UE_HANDOVER_ABORT)); werr != nil {
-			g.RanLog.Warnf("Error sending handover abort to UE %s: %v", imsi, werr)
-		}
-		if entry.release && dcSelfTeid != nil {
-			g.teidGenerator.ReleaseTeid(dcSelfTeid)
-		}
 		g.notifyHandoverComplete(entry, imsi, XnHandoverAckMsg{Accepted: false, Reason: ack.err.Error()})
 		return fmt.Errorf("path switch failed: %v", ack.err)
-	}
-
-	// The core has switched: the UE may now swap its connections and close
-	// the old path. Until this commit it kept both, so downlink redirected
-	// by the FAR update was already received on the new leg while in-flight
-	// packets drained on the old one - no window in either direction.
-	if _, werr := ranUe.GetN1Conn().Write([]byte(constant.UE_HANDOVER_COMMIT)); werr != nil {
-		g.RanLog.Warnf("Error sending handover commit to UE %s: %v", imsi, werr)
 	}
 
 	if len(ack.ulPrimaryTeid) > 0 {

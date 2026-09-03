@@ -1098,41 +1098,10 @@ func (u *Ue) performHandover(payload []byte) {
 		}
 		return
 	}
-	u.RanLog.Infoln("Target ready; holding old path until the core switch commits")
-
-	// Wait for the target's verdict on the Path Switch. Until COMMIT the old
-	// connections stay open: uplink keeps flowing through the source, and
-	// downlink is received on whichever leg the core currently uses (the
-	// reader on the new data plane has been running since it was dialed).
-	// On ABORT (or silence) the new path is discarded and the session
-	// continues on the old master untouched.
-	if err := newCp.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		u.RanLog.Errorf("Error set read deadline on new control plane: %+v", err)
-		return
-	}
-	n, err = newCp.Read(readyBuffer)
-	verdict := ""
-	if err == nil {
-		verdict = string(readyBuffer[:n])
-	}
-	if err != nil || !strings.HasPrefix(verdict, constant.UE_HANDOVER_COMMIT) {
-		if strings.HasPrefix(verdict, constant.UE_HANDOVER_ABORT) {
-			u.RanLog.Warnln("Handover aborted by target (path switch failed); keeping old path")
-		} else {
-			u.RanLog.Errorf("Handover aborted: no commit from target (n=%d, err=%v); keeping old path", n, err)
-		}
-		if closeErr := newCp.Close(); closeErr != nil {
-			u.RanLog.Warnf("Error close new control plane: %+v", closeErr)
-		}
-		if closeErr := newDp.Close(); closeErr != nil {
-			u.RanLog.Warnf("Error close new data plane: %+v", closeErr)
-		}
-		return
-	}
 	if err := newCp.SetReadDeadline(time.Time{}); err != nil {
 		u.RanLog.Warnf("Error clear read deadline: %+v", err)
 	}
-	u.RanLog.Infoln("Core switch committed; swapping connections")
+	u.RanLog.Infoln("Target confirmed data plane ready; swapping connections")
 
 	u.rwLock.Lock()
 	oldCp := u.ranControlPlaneConn
