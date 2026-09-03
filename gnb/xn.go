@@ -1,9 +1,12 @@
 package gnb
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 
@@ -95,7 +98,14 @@ func xnInterfaceProcessor(conn net.Conn, g *Gnb) {
 		g.XnLog.Warnln("Unexpected XN Handover Ack on listener")
 		return
 	case XnTypeForward:
-		xnForwardProcessor(g, conn, &xnPdu)
+		// primer wire size = 3 (header) + imsiLen + len(Data); Data is empty
+		// for the primer, so leftover after it are the first framed relay bytes.
+		primerSize := 3 + int(xnPdu.ImsiLength) + len(xnPdu.Data)
+		leftover := []byte{}
+		if n > primerSize {
+			leftover = buffer[primerSize:n]
+		}
+		xnForwardProcessor(g, conn, &xnPdu, leftover)
 		return
 	}
 
@@ -408,18 +418,30 @@ func xnReleaseUeProcessor(g *Gnb, conn net.Conn, imsi string) bool {
 // xnForwardProcessor receives forwarded DL from the source MN and buffers it
 // per IMSI until the UE attaches here, then flushForwardedPackets drains it
 // ahead of live traffic. The first frame is parsed; the rest stream off conn.
-func xnForwardProcessor(g *Gnb, conn net.Conn, first *XnPdu) {
+func xnForwardProcessor(g *Gnb, conn net.Conn, first *XnPdu, leftover []byte) {
 	g.XnLog.Infof("Receiving forwarded DL for UE %s", first.Imsi)
-	g.bufferForwardedPacket(first.Imsi, first.Data)
-	buffer := make([]byte, 4096)
+	// The primer arrived unframed via the listener dispatch. Any bytes the
+	// listener read past the primer are the first framed relay bytes; splice
+	// them back in front of the connection stream so none are lost.
+	reader := bufio.NewReader(io.MultiReader(bytes.NewReader(leftover), conn))
+	lenBuf := make([]byte, 4)
 	for {
-		n, err := conn.Read(buffer)
-		if err != nil {
+		if _, err := io.ReadFull(reader, lenBuf); err != nil {
 			g.XnLog.Infof("Forwarded DL stream for UE %s ended: %v", first.Imsi, err)
 			return
 		}
+		frameLen := binary.BigEndian.Uint32(lenBuf)
+		if frameLen == 0 || frameLen > 65536 {
+			g.XnLog.Warnf("Invalid forwarded frame length %d, closing stream", frameLen)
+			return
+		}
+		body := make([]byte, frameLen)
+		if _, err := io.ReadFull(reader, body); err != nil {
+			g.XnLog.Infof("Forwarded DL stream for UE %s ended mid-frame: %v", first.Imsi, err)
+			return
+		}
 		pdu := XnPdu{}
-		if err := pdu.Unmarshal(buffer[:n]); err != nil {
+		if err := pdu.Unmarshal(body); err != nil {
 			g.XnLog.Warnf("Error unmarshal forwarded frame: %v", err)
 			continue
 		}
@@ -429,6 +451,20 @@ func xnForwardProcessor(g *Gnb, conn net.Conn, first *XnPdu) {
 		}
 		g.bufferForwardedPacket(pdu.Imsi, pdu.Data)
 	}
+}
+
+// writeFramedXnPdu sends a length-prefixed XnPdu over a stream connection so
+// the receiver can recover message boundaries (raw TCP has none).
+func writeFramedXnPdu(conn net.Conn, pdu *XnPdu) error {
+	body, err := pdu.Marshal()
+	if err != nil {
+		return err
+	}
+	frame := make([]byte, 4+len(body))
+	binary.BigEndian.PutUint32(frame[:4], uint32(len(body)))
+	copy(frame[4:], body)
+	_, err = conn.Write(frame)
+	return err
 }
 
 type forwardQueue struct {

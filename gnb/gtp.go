@@ -158,12 +158,7 @@ func forwardPacketToUe(gtpPacket []byte, ranDataPlaneServer *net.UDPConn, dlTeid
 		gnbLogger.GtpLog.Debugf("Loaded UE %s for DL TEID: %s", u.GetMobileIdentityIMSI(), teid)
 		if fwd := u.ForwardConn(); fwd != nil {
 			frame := NewTypedXnPdu(XnTypeForward, u.GetMobileIdentityIMSI(), payload)
-			raw, mErr := frame.Marshal()
-			if mErr != nil {
-				gnbLogger.GtpLog.Warnf("Error marshal forwarded frame: %v", mErr)
-				return
-			}
-			if _, wErr := fwd.Write(raw); wErr != nil {
+			if wErr := writeFramedXnPdu(fwd, frame); wErr != nil {
 				gnbLogger.GtpLog.Warnf("Error forwarding DL to target: %v", wErr)
 			}
 			return
