@@ -98,12 +98,17 @@ func xnInterfaceProcessor(conn net.Conn, g *Gnb) {
 		g.XnLog.Warnln("Unexpected XN Handover Ack on listener")
 		return
 	case XnTypeForward:
-		// primer wire size = 3 (header) + imsiLen + len(Data); Data is empty
-		// for the primer, so leftover after it are the first framed relay bytes.
-		primerSize := 3 + int(xnPdu.ImsiLength) + len(xnPdu.Data)
+		// The primer is a header-only frame: 1 type byte + 2 imsiLen bytes +
+		// imsi. Its true wire size is computed from the header alone (NOT from
+		// xnPdu.Data, which Unmarshal fills with any coalesced relay bytes
+		// that followed the primer in this read). Everything past the primer
+		// is the start of the length-prefixed relay stream and is spliced
+		// into the framed reader so no bytes are lost or misparsed.
+		imsiLen := int(binary.BigEndian.Uint16(buffer[1:3]))
+		primerSize := 3 + imsiLen
 		leftover := []byte{}
 		if n > primerSize {
-			leftover = buffer[primerSize:n]
+			leftover = append(leftover, buffer[primerSize:n]...)
 		}
 		xnForwardProcessor(g, conn, &xnPdu, leftover)
 		return
