@@ -617,24 +617,36 @@ func (g *Gnb) completePendingHandover(imsi string, ranUe *RanUe) error {
 
 	// Swap-with-release: the DC FAR currently points at the old master's
 	// leg, which is about to disappear. The SMF has no DC-removal path
-	// (HandlePDUSessionResourceModifyIndicationTransfer never clears DC
-	// state), but it DOES update the DC tunnel whenever the PathSwitch ext
-	// is present - so the release is realized as a repoint: the ext names a
-	// second TEID on THIS gNB, collapsing both hash slots onto the survivor.
-	var dcSelfTeid []byte
+	// The SMF has no DC-removal path in HandlePDUSessionResourceModify
+	// IndicationTransfer, so release is a two-phase serve-then-switch: the
+	// PathSwitch keeps old-MN's leg serving (DC ext = old-MN, below), then a
+	// modify indication removes it (step 8). old-MN forwards DL across the
+	// window (step 6).
 	includeDcExt := false
+	var secondaryDlTeid []byte
 	secondaryN3Ip := ""
 	if entry.release {
-		dcSelfTeid = g.teidGenerator.AllocateTeid()
+		// Option B (3GPP TS 37.340 §10.4.2 fig 10.4.2-1): do NOT collapse the
+		// DL onto this gNB at the PathSwitch. Instead keep the released node's
+		// leg (old-MN) serving DL by carrying it UNCHANGED in the DC ext, so
+		// the UPF keeps hash-splitting. old-MN keeps receiving DL and forwards
+		// it to us (step 6) across the serving window; the release indication
+		// (step 8, below) is what finally removes old-MN's leg. This gives a
+		// real serve-then-switch window matching the standard, rather than an
+		// early collapse.
+		if t, derr := hex.DecodeString(entry.ctx.SecondaryDlTeid); derr == nil {
+			secondaryDlTeid = t
+		}
+		secondaryN3Ip = entry.ctx.SecondaryN3Ip
 		includeDcExt = true
-		secondaryN3Ip = g.ranN3Ip
-		g.XnLog.Infof("Release mode: collapsing secondary onto this gNB (second DL TEID %s)",
-			hex.EncodeToString(dcSelfTeid))
+		g.XnLog.Infof("Release mode (serve-then-switch): keeping old-MN leg %s@%s serving; "+
+			"forwarding covers the window until DC release",
+			entry.ctx.SecondaryDlTeid, secondaryN3Ip)
 	}
 	psRaw, err := g.buildPathSwitchRequestWithDC(
 		includeDcExt,
 		ranUe.GetRanUeId(), entry.ctx.AmfUeNgapId, entry.ctx.PduSessionId,
-		ranUe.GetDlTeid(), dcSelfTeid, secondaryN3Ip)
+		ranUe.GetDlTeid(), secondaryDlTeid, secondaryN3Ip)
 	if err != nil {
 		g.notifyHandoverComplete(entry, imsi, XnHandoverAckMsg{Accepted: false, Reason: err.Error()})
 		return fmt.Errorf("build PathSwitchRequest: %v", err)
@@ -644,7 +656,7 @@ func (g *Gnb) completePendingHandover(imsi string, ranUe *RanUe) error {
 		return fmt.Errorf("send PathSwitchRequest: %v", err)
 	}
 	if entry.release {
-		g.NgapLog.Infoln("Sent PathSwitchRequest (release: DC ext = self) to AMF")
+		g.NgapLog.Infoln("Sent PathSwitchRequest (release: DC ext = old-MN leg kept serving) to AMF")
 	} else {
 		g.NgapLog.Infoln("Sent PathSwitchRequest (MN->MN', no DC ext) to AMF")
 	}
@@ -665,11 +677,11 @@ func (g *Gnb) completePendingHandover(imsi string, ranUe *RanUe) error {
 	}
 
 	if entry.release {
-		// Both DL hash slots now terminate here: map the second TEID to the
-		// same UE so either slot delivers.
-		g.dlTeidToUe.Store(hex.EncodeToString(dcSelfTeid), ranUe)
-		// Drop the XnUe bookkeeping WITHOUT releasing its TEID - that TEID
-		// is now the RanUe's primary and is freed with the RanUe.
+		// PathSwitch is acknowledged: primary DL is now at this gNB (old-SN),
+		// and old-MN's leg is STILL serving via the DC ext (UPF hash-splits).
+		// old-MN keeps receiving DL and forwarding it to us (step 6); it is
+		// still blocked on the handover-complete read, so its forwarding
+		// stays active until we send the completion below.
 		g.xnUeConns.Range(func(key, _ any) bool {
 			if xnUe, ok := key.(*XnUe); ok && xnUe.GetIMSI() == imsi {
 				g.xnUeConns.Delete(key)
@@ -677,25 +689,20 @@ func (g *Gnb) completePendingHandover(imsi string, ranUe *RanUe) error {
 			}
 			return true
 		})
-		g.XnLog.Infof("Secondary collapsed onto this gNB for UE %s; requesting DC release at the core", imsi)
+		g.XnLog.Infof("Path switched for UE %s; old-MN leg still serving+forwarding, requesting DC release (step 8)", imsi)
 
-		// Real removal: modify indication without the DC ext -> SMF removes
-		// the secondary leg's PDR/FARs (UPF prunes its DL path cache) ->
-		// confirm -> dispatcher pushes UE_TUNNEL_UPDATE (UE closes its dc
-		// connection) and deactivates NRDC. If the core does not support
-		// release (unpatched SMF), we time out and stay in the collapsed
-		// state, which is still fully functional.
+		// Step 8: modify indication without the DC ext -> SMF removes old-MN's
+		// leg PDR/FARs (UPF prunes its DL path cache). Only AFTER this does DL
+		// stop arriving at old-MN. The subsequent handover-complete tells
+		// old-MN to stop forwarding, closing the window with no gap.
 		if err := g.sendDcReleaseIndication(ranUe); err != nil {
-			g.XnLog.Warnf("DC release at core failed for UE %s (%v); keeping collapsed DC (both slots on this gNB)", imsi, err)
+			g.XnLog.Warnf("DC release at core failed for UE %s (%v); DC remains (old-MN leg still active)", imsi, err)
 			if _, werr := ranUe.GetN1Conn().Write([]byte(constant.UE_TUNNEL_UPDATE)); werr != nil {
 				g.RanLog.Warnf("Error sending tunnel update (dc teardown) to UE %s: %v", imsi, werr)
 			}
 			ranUe.DeactivateNrdc()
 		} else {
-			// the second-slot TEID no longer exists at the core: unmap and free it
-			g.dlTeidToUe.Delete(hex.EncodeToString(dcSelfTeid))
-			g.teidGenerator.ReleaseTeid(dcSelfTeid)
-			g.XnLog.Infof("Secondary fully released for UE %s: DC rules removed at the core, single tunnel remains", imsi)
+			g.XnLog.Infof("Secondary fully released for UE %s: old-MN leg removed at the core, single tunnel remains", imsi)
 		}
 	}
 
