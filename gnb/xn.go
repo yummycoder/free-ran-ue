@@ -433,6 +433,7 @@ func xnForwardProcessor(g *Gnb, conn net.Conn, first *XnPdu, leftover []byte) {
 	for {
 		if _, err := io.ReadFull(reader, lenBuf); err != nil {
 			g.XnLog.Infof("Forwarded DL stream for UE %s ended: %v", first.Imsi, err)
+			g.forwardStats(first.Imsi)
 			return
 		}
 		frameLen := binary.BigEndian.Uint32(lenBuf)
@@ -443,6 +444,7 @@ func xnForwardProcessor(g *Gnb, conn net.Conn, first *XnPdu, leftover []byte) {
 		body := make([]byte, frameLen)
 		if _, err := io.ReadFull(reader, body); err != nil {
 			g.XnLog.Infof("Forwarded DL stream for UE %s ended mid-frame: %v", first.Imsi, err)
+			g.forwardStats(first.Imsi)
 			return
 		}
 		pdu := XnPdu{}
@@ -473,10 +475,18 @@ func writeFramedXnPdu(conn net.Conn, pdu *XnPdu) error {
 }
 
 type forwardQueue struct {
-	mu      sync.Mutex
-	ready   bool
-	addr    *net.UDPAddr
-	packets [][]byte
+	mu           sync.Mutex
+	ready        bool
+	addr         *net.UDPAddr
+	packets      [][]byte
+	// Per-stage counters (review point #1): "Flushed N" alone is misleading
+	// because packets arriving after the flush are delivered live and never
+	// counted. Track every stage so the log reflects what forwarding actually
+	// carried, whether buffered-then-flushed or delivered live in the window.
+	nReceived    uint64 // frames accepted off the forward stream (non-primer)
+	nBuffered    uint64 // buffered because target not yet attached
+	nFlushed     uint64 // drained from buffer at attach
+	nLiveDeliver uint64 // delivered live (arrived after flush - the serving window)
 }
 
 // bufferForwardedPacket appends under the queue lock, or delivers live if the
@@ -489,8 +499,10 @@ func (g *Gnb) bufferForwardedPacket(imsi string, payload []byte) {
 	actual, _ := g.forwardBuffer.LoadOrStore(imsi, &forwardQueue{})
 	q := actual.(*forwardQueue)
 	q.mu.Lock()
+	q.nReceived++
 	if q.ready {
 		addr := q.addr
+		q.nLiveDeliver++
 		q.mu.Unlock()
 		if addr != nil {
 			if _, err := g.ranDataPlaneServer.WriteToUDP(payload, addr); err != nil {
@@ -499,6 +511,7 @@ func (g *Gnb) bufferForwardedPacket(imsi string, payload []byte) {
 		}
 		return
 	}
+	q.nBuffered++
 	q.packets = append(q.packets, payload)
 	q.mu.Unlock()
 }
@@ -518,6 +531,22 @@ func (g *Gnb) flushForwardedPackets(imsi string, addr *net.UDPAddr) {
 			g.XnLog.Warnf("Error flushing forwarded packet: %v", err)
 		}
 	}
+	q.nFlushed += uint64(len(pkts))
 	q.mu.Unlock()
-	g.XnLog.Infof("Flushed %d forwarded packets for UE %s", len(pkts), imsi)
+	g.XnLog.Infof("Flushed %d buffered forwarded packets for UE %s", len(pkts), imsi)
+}
+
+// forwardStats logs the full per-stage tally for a UE's forwarding, so the
+// serving-window traffic (delivered live) is visible instead of hidden behind
+// a stale "Flushed 0". Called when the forward stream ends.
+func (g *Gnb) forwardStats(imsi string) {
+	actual, ok := g.forwardBuffer.Load(imsi)
+	if !ok {
+		return
+	}
+	q := actual.(*forwardQueue)
+	q.mu.Lock()
+	g.XnLog.Infof("Forwarding stats for UE %s: received=%d buffered=%d flushed=%d liveDelivered=%d",
+		imsi, q.nReceived, q.nBuffered, q.nFlushed, q.nLiveDeliver)
+	q.mu.Unlock()
 }

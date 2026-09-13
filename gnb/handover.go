@@ -582,6 +582,44 @@ func (g *Gnb) processMnToSnHandover(ranUe *RanUe, pduSessionId int64, targetXnIp
 		return nil, fmt.Errorf("handover failed at target: %s", complete.Reason)
 	}
 
+	// Quiescence drain (on old-MN, the forwarding node): the new master has
+	// completed the DC release (step 8) by the time it sends the completion,
+	// so the UPF has stopped routing new DL to old-MN's leg. Keep forwarding
+	// until this node's own leg is quiescent - no forwarded DL for a short
+	// quiet-period, i.e. the in-flight queue has drained - so late packets are
+	// forwarded rather than dropped when we return and the deferred
+	// StopForwarding fires. Bounded by a safety cap. This runs where the
+	// activity timestamp actually lives (this RanUe, this process).
+	if ranUe.ForwardConn() != nil {
+		const quietPeriod = 5 * time.Millisecond
+		const drainCap = 500 * time.Millisecond
+
+		// Measure quiet time from the moment draining STARTS (now), not from the
+		// last packet's age: a packet already in flight toward old-MN when
+		// completion arrived has not been recorded yet, so prior inactivity must
+		// not count. Reset the quiet window whenever NEW activity is observed
+		// (the timestamp changes). No-traffic case exits after one quietPeriod.
+		drainStart := time.Now()
+		quietSince := drainStart
+		lastSeen := ranUe.LastForwardNano()
+		for {
+			current := ranUe.LastForwardNano()
+			if current != lastSeen {
+				lastSeen = current
+				quietSince = time.Now()
+			}
+			if time.Since(quietSince) >= quietPeriod {
+				break // quietPeriod of silence since we started watching: drained
+			}
+			if time.Since(drainStart) >= drainCap {
+				g.XnLog.Warnf("Forward drain cap reached for UE %s", hoCtx.Imsi)
+				break
+			}
+			time.Sleep(500 * time.Microsecond)
+		}
+		g.XnLog.Infof("Forward drain complete for UE %s (leg quiescent)", hoCtx.Imsi)
+	}
+
 	g.XnLog.Infof("Handover complete: UE %s moved to new master (UL primary TEID %s); "+
 		"this gNB no longer serves it", hoCtx.Imsi, complete.UlPrimaryTeid)
 	return &complete, nil
@@ -689,14 +727,24 @@ func (g *Gnb) completePendingHandover(imsi string, ranUe *RanUe) error {
 			}
 			return true
 		})
-		g.XnLog.Infof("Path switched for UE %s; old-MN leg still serving+forwarding, requesting DC release (step 8)", imsi)
+		// No artificial serving window: the UE has already re-anchored to the
+		// new master (the ready-barrier completed before this PathSwitch), so
+		// old-MN is no longer serving the UE - it only still receives DL
+		// because its FAR is not yet removed. Request the release (step 8)
+		// immediately; forwarding then covers exactly the in-flight DL until
+		// old-MN's leg goes quiescent. No wall-clock guess.
+		// Step 8 immediately: no artificial serving window (the UE already
+		// re-anchored before this PathSwitch, so old-MN is not serving the UE;
+		// its leg only exists until the FAR is removed). The quiescence DRAIN
+		// happens on old-MN (the node that actually forwards and holds the
+		// activity timestamp) between it receiving the handover-complete and
+		// stopping forwarding - NOT here on the new master, which has a
+		// different RanUe in a different process.
+		g.XnLog.Infof("Path switched for UE %s; requesting DC release (step 8)", imsi)
+		relErr := g.sendDcReleaseIndication(ranUe)
 
-		// Step 8: modify indication without the DC ext -> SMF removes old-MN's
-		// leg PDR/FARs (UPF prunes its DL path cache). Only AFTER this does DL
-		// stop arriving at old-MN. The subsequent handover-complete tells
-		// old-MN to stop forwarding, closing the window with no gap.
-		if err := g.sendDcReleaseIndication(ranUe); err != nil {
-			g.XnLog.Warnf("DC release at core failed for UE %s (%v); DC remains (old-MN leg still active)", imsi, err)
+		if relErr != nil {
+			g.XnLog.Warnf("DC release at core failed for UE %s (%v); DC remains (old-MN leg still active)", imsi, relErr)
 			if _, werr := ranUe.GetN1Conn().Write([]byte(constant.UE_TUNNEL_UPDATE)); werr != nil {
 				g.RanLog.Warnf("Error sending tunnel update (dc teardown) to UE %s: %v", imsi, werr)
 			}

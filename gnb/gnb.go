@@ -49,6 +49,7 @@ type api struct {
 }
 
 type Gnb struct {
+
 	amfN2Ip string
 	ranN2Ip string
 	upfN3Ip string

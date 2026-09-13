@@ -161,6 +161,7 @@ func forwardPacketToUe(gtpPacket []byte, ranDataPlaneServer *net.UDPConn, dlTeid
 			if wErr := writeFramedXnPdu(fwd, frame); wErr != nil {
 				gnbLogger.GtpLog.Warnf("Error forwarding DL to target: %v", wErr)
 			}
+			u.MarkForwardActivity()
 			return
 		}
 		dataPlaneAddress := u.GetDataPlaneAddress()

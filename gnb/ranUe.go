@@ -1,6 +1,8 @@
 package gnb
 
 import (
+	"sync/atomic"
+	"time"
 	"fmt"
 	"net"
 	"strings"
@@ -77,6 +79,10 @@ type RanUe struct {
 	// relays this UE's DL to the target over this Xn conn instead of dropping.
 	forwardConn net.Conn
 	forwardMtx  sync.Mutex
+	// lastForwardNano: monotonic time (ns) of the most recent forwarded DL
+	// packet, updated on the datapath. Lets the release drain until the leg
+	// is quiescent instead of waiting a fixed wall-clock window.
+	lastForwardNano int64
 
 	// Dynamic-NRDC add targets (batch 4b): when set, the modify-indication
 	// lane dials this Xn peer instead of the configured one, and the UE is
@@ -136,6 +142,14 @@ func (r *RanUe) ForwardConn() net.Conn {
 	r.forwardMtx.Lock()
 	defer r.forwardMtx.Unlock()
 	return r.forwardConn
+}
+
+func (r *RanUe) MarkForwardActivity() {
+	atomic.StoreInt64(&r.lastForwardNano, time.Now().UnixNano())
+}
+
+func (r *RanUe) LastForwardNano() int64 {
+	return atomic.LoadInt64(&r.lastForwardNano)
 }
 
 func (r *RanUe) StopForwarding() {
