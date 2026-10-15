@@ -49,7 +49,6 @@ type api struct {
 }
 
 type Gnb struct {
-
 	amfN2Ip string
 	ranN2Ip string
 	upfN3Ip string
@@ -909,15 +908,16 @@ func (g *Gnb) processUePduSessionModifyIndication(ranUe *RanUe) error {
 	}
 	g.NgapLog.Tracef("Get pdu session modify indication: %+v", pduSessionModifyIndication)
 
-	xnIp, xnPort := g.xnInterface.xnDialIp, g.xnInterface.xnDialPort
 	if ranUe.dcTargetXnIp != "" {
-		xnIp, xnPort = ranUe.dcTargetXnIp, ranUe.dcTargetXnPort
+		xnIp, xnPort := ranUe.dcTargetXnIp, ranUe.dcTargetXnPort
+		if pduSessionModifyIndication, err = g.xnPduSessionResourceModifyIndication(ranUe.GetMobileIdentityIMSI(), pduSessionModifyIndication, xnIp, xnPort); err != nil {
+			g.XnLog.Errorf("Error xn pdu session resource modify indication: %v", err)
+			return fmt.Errorf("error xn pdu session resource modify indication: %v", err)
+		}
+		g.XnLog.Tracef("Get pdu session modify indication: %+v", pduSessionModifyIndication)
+	} else {
+		g.NgapLog.Infoln("N3IWF-SN mode (no targetXn): sending modify-indication straight to AMF")
 	}
-	if pduSessionModifyIndication, err = g.xnPduSessionResourceModifyIndication(ranUe.GetMobileIdentityIMSI(), pduSessionModifyIndication, xnIp, xnPort); err != nil {
-		g.XnLog.Errorf("Error xn pdu session resource modify indication: %v", err)
-		return fmt.Errorf("error xn pdu session resource modify indication: %v", err)
-	}
-	g.XnLog.Tracef("Get pdu session modify indication: %+v", pduSessionModifyIndication)
 
 	n, err := g.n2Conn.Write(pduSessionModifyIndication)
 	if err != nil {

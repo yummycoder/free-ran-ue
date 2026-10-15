@@ -121,3 +121,20 @@ func deriveResStarAndSetKey(supi string, cipheringAlgorithm ie.AlgCiphering, int
 	}
 	return kAmf, kenc, kint, kdfVal_for_resStar[len(kdfVal_for_resStar)/2:], hex.EncodeToString(sqnHex), nil
 }
+
+// deriveKN3IWFSN mirrors the AMF's K_N3IWF_SN derivation (FC=0x6E) so the UE
+// computes the same key from its own K_AMF, no manual copy. Inputs MUST match
+// the AMF byte-for-byte: P0=SUPI string ("imsi-<...>"), P1=AccessType non-3GPP
+// (0x02), P2=PDU session ID.
+func deriveKN3IWFSN(kAmf []byte, supi string, pduSessionID uint8) ([]byte, error) {
+	P0 := []byte(supi)
+	P1 := []byte{0x02} // AccessTypeNon3GPP
+	P2 := []byte{pduSessionID}
+	return ueauth.GetKDFValue(
+		kAmf,
+		ueauth.FC_FOR_KGNB_KN3IWF_DERIVATION,
+		P0, ueauth.KDFLen(P0),
+		P1, ueauth.KDFLen(P1),
+		P2, ueauth.KDFLen(P2),
+	)
+}

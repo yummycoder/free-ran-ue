@@ -322,7 +322,7 @@ func (d *ngapDispatcher) pduSessionResourceModifyIndicationProcessor(g *Gnb, msg
 	}
 
 	// send confirm to Xn for update xnUE ULTEID
-	if !ranUe.IsNrdcActivated() {
+	if !ranUe.IsNrdcActivated() && ranUe.dcTargetXnIp != "" {
 		xnIp, xnPort := g.xnInterface.xnDialIp, g.xnInterface.xnDialPort
 		if ranUe.dcTargetXnIp != "" {
 			xnIp, xnPort = ranUe.dcTargetXnIp, ranUe.dcTargetXnPort
@@ -336,26 +336,33 @@ func (d *ngapDispatcher) pduSessionResourceModifyIndicationProcessor(g *Gnb, msg
 
 	// send modify message to UE; when the dc leg targets a non-configured
 	// gNB, append its data-plane endpoint so the UE dials the right place
-	modifyMessage := []byte(constant.UE_TUNNEL_UPDATE)
-	if !ranUe.IsNrdcActivated() && ranUe.dcTargetDpIp != "" {
-		payload, err := json.Marshal(struct {
-			DpIp   string `json:"dpIp"`
-			DpPort int    `json:"dpPort"`
-		}{ranUe.dcTargetDpIp, ranUe.dcTargetDpPort})
+	// Notify the UE only when it has a real gNB-side DC leg (legacy Xn/Dp
+	// NR-DC). In N3IWF-SN mode the UE secondary leg is the IPsec tunnel to
+	// the N3IWF (via n3iwue), not a gNB DC data plane, so pushing
+	// UE_TUNNEL_UPDATE to the 3GPP UE would switch it to NRDC mode and break
+	// its MN leg.
+	if ranUe.dcTargetXnIp != "" || ranUe.dcTargetDpIp != "" {
+		modifyMessage := []byte(constant.UE_TUNNEL_UPDATE)
+		if !ranUe.IsNrdcActivated() && ranUe.dcTargetDpIp != "" {
+			payload, err := json.Marshal(struct {
+				DpIp   string `json:"dpIp"`
+				DpPort int    `json:"dpPort"`
+			}{ranUe.dcTargetDpIp, ranUe.dcTargetDpPort})
+			if err != nil {
+				g.NgapLog.Errorf("Error marshal dc dial payload: %v", err)
+				return
+			}
+			modifyMessage = append([]byte(constant.UE_TUNNEL_UPDATE+" "), payload...)
+		}
+
+		n, err := ranUe.GetN1Conn().Write(modifyMessage)
 		if err != nil {
-			g.NgapLog.Errorf("Error marshal dc dial payload: %v", err)
+			g.NgapLog.Errorf("Error send modify message to UE: %v", err)
 			return
 		}
-		modifyMessage = append([]byte(constant.UE_TUNNEL_UPDATE+" "), payload...)
+		g.NgapLog.Tracef("Sent %d bytes of modify message to UE", n)
+		g.NgapLog.Debugln("Send Modify Message to UE")
 	}
-
-	n, err := ranUe.GetN1Conn().Write(modifyMessage)
-	if err != nil {
-		g.NgapLog.Errorf("Error send modify message to UE: %v", err)
-		return
-	}
-	g.NgapLog.Tracef("Sent %d bytes of modify message to UE", n)
-	g.NgapLog.Debugln("Send Modify Message to UE")
 
 	// update ranUe NRDC status
 	if ranUe.IsNrdcActivated() {

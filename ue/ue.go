@@ -26,7 +26,8 @@ import (
 type authentication struct {
 	supi string
 
-	kAmf []uint8
+	kAmf   []uint8
+	kN3iwf []uint8
 
 	secCtx *message.SecCtx
 }
@@ -407,6 +408,14 @@ func (u *Ue) processUeRegistration() error {
 		return fmt.Errorf("error derive res star and set key: %+v", err)
 	} else {
 		u.kAmf = kAmf
+
+		if kN3iwf, derr := deriveKN3IWFSN(u.kAmf, "imsi-"+u.supi, uint8(constant.PDU_SESSION_ID)); derr != nil {
+			u.NasLog.Errorf("derive K_N3IWF_SN: %v", derr)
+		} else {
+			u.kN3iwf = kN3iwf
+			StartSNKeyTrigger("imsi-"+u.supi, uint8(constant.PDU_SESSION_ID), func() []byte { return u.kN3iwf }, u.NasLog.Warnf)
+			u.NasLog.Infof("K_N3IWF_SN (UE-derived) SUPI=imsi-%s PDU=%d key=%x", u.supi, constant.PDU_SESSION_ID, kN3iwf)
+		}
 		copy(u.secCtx.KnasEnc[:], kenc[16:32])
 		copy(u.secCtx.KnasInt[:], kint[16:32])
 		u.authenticationSubscription.sequenceNumber = newSqn
