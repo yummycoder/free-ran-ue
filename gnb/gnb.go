@@ -65,8 +65,9 @@ type Gnb struct {
 	ranControlPlanePort int
 	ranDataPlanePort    int
 
-	n2Conn *sctp.SCTPConn
-	n3Conn *net.UDPConn
+	n2Conn    *sctp.SCTPConn
+	n3Conn    *net.UDPConn
+	upfN3Addr *net.UDPAddr // UPF N3 peer for uplink GTP-U (socket is unconnected)
 
 	gnbId   []byte
 	gnbName string
@@ -434,14 +435,21 @@ func (g *Gnb) connectToUpf() error {
 		return fmt.Errorf("error resolving RAN N3 IP address: %v", err)
 	}
 
-	conn, err := net.DialUDP("udp", ranAddr, upfAddr)
+	// Bind an UNCONNECTED socket. A connected UDP socket (DialUDP) makes the
+	// kernel drop every datagram whose source is not exactly upfAddr; the UPF
+	// may legitimately source DL GTP-U from a different N3 address (e.g. the
+	// NR-DC master-gNB FAR is stamped with the UPF's N3IWF-side N3 IP), which
+	// silently blackholed the whole MN downlink. Uplink addresses the UPF
+	// explicitly via WriteToUDP.
+	conn, err := net.ListenUDP("udp", ranAddr)
 	if err != nil {
-		return fmt.Errorf("error connecting to UPF: %v", err)
+		return fmt.Errorf("error binding N3 GTP-U socket: %v", err)
 	}
-	g.GtpLog.Debugln("Dial UDP to UPF success")
+	g.GtpLog.Debugln("Bind N3 GTP-U socket success")
 
 	g.n3Conn = conn
-	g.RanLog.Infof("Connected to UPF: %v, local: %v", upfAddr.String(), conn.LocalAddr().String())
+	g.upfN3Addr = upfAddr
+	g.RanLog.Infof("N3 GTP-U bound on %v (unconnected), UPF peer %v", conn.LocalAddr().String(), upfAddr.String())
 	return nil
 }
 
@@ -541,7 +549,7 @@ func (g *Gnb) startGtpProcessor(ctx context.Context) {
 
 	g.gtpChannel = make(chan []byte)
 
-	go forwardGtpPacketToN3Conn(ctx, g.n3Conn, g.gtpChannel, g.GnbLogger)
+	go forwardGtpPacketToN3Conn(ctx, g.n3Conn, g.upfN3Addr, g.gtpChannel, g.GnbLogger)
 	g.GtpLog.Debugln("Forward GTP packet to N3 connection started")
 
 	go receiveGtpPacketFromN3Conn(ctx, g.n3Conn, g.ranDataPlaneServer, g.GnbLogger, &g.dlTeidToUe)

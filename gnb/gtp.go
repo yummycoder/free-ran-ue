@@ -75,14 +75,15 @@ func (t *TeidGenerator) deFormatFromString(teid string) int64 {
 }
 
 // get packet with GTP header from gtpChannel and forward to N3 connection
-func forwardGtpPacketToN3Conn(ctx context.Context, n3Conn *net.UDPConn, gtpChannel chan []byte, gnbLogger *logger.GnbLogger) {
+func forwardGtpPacketToN3Conn(ctx context.Context, n3Conn *net.UDPConn, upfAddr *net.UDPAddr, gtpChannel chan []byte, gnbLogger *logger.GnbLogger) {
 	for {
 		select {
 		case <-ctx.Done():
 			gnbLogger.GtpLog.Debugln("Forward GTP packet to N3 connection stopped")
 			return
 		case packet := <-gtpChannel:
-			n, err := n3Conn.Write(packet)
+			// socket is unconnected: address the UPF N3 peer explicitly
+			n, err := n3Conn.WriteToUDP(packet, upfAddr)
 			if err != nil {
 				gnbLogger.GtpLog.Errorf("Error writing GTP packet to N3 connection: %v", err)
 				return
